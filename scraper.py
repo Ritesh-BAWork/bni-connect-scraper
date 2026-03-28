@@ -709,10 +709,18 @@ def main():
         if GOOGLE_WEBAPP_URL and GOOGLE_WEBAPP_URL != "YOUR_URL":
             print("📤 Google Sheet posting was enabled")
         print("=" * 70)
+        
+print("\nClosing browser...")
 
-        print("\nClosing browser...")
-context.close()
-browser.close()
+try:
+    context.close()
+except:
+    pass
+
+try:
+    browser.close()
+except:
+    pass
 
 
 if __name__ == "__main__":
