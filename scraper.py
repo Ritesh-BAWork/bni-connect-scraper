@@ -15,18 +15,13 @@ except ImportError:
 # =========================
 # CONFIG
 # =========================
-LOGIN_URL = "https://app.bniconnectglobal.com/login"
+LOGIN_URL = "https://www.bniconnectglobal.com/web/"
 SEARCH_URL_CANDIDATES = [
-    "https://app.bniconnectglobal.com/search/member",
-    "https://app.bniconnectglobal.com/search/members",
-    "https://app.bniconnectglobal.com/search",
+    "https://www.bniconnectglobal.com/v2/dashboard",
+    "https://www.bniconnectglobal.com/web/",
 ]
 
-BASE_URLS = [
-    "https://app.bniconnectglobal.com",
-    "https://www.bniconnectglobal.com",
-]
-
+BASE_URL = "https://www.bniconnectglobal.com"
 CSV_FILE = "bni_multi_city_owners.csv"
 
 EMAIL = os.getenv("BNI_EMAIL", "").strip()
@@ -81,16 +76,6 @@ def save_csv(rows):
             writer.writerow(row)
 
 
-async def safe_text(locator):
-    try:
-        if await locator.count() > 0:
-            txt = await locator.first.inner_text()
-            return txt.strip()
-    except:
-        pass
-    return ""
-
-
 async def save_page_html(page, filename):
     try:
         html = await page.content()
@@ -109,6 +94,7 @@ async def debug_selector_counts(page):
         "a[href*='member']",
         "a[href*='Member']",
         "a[href*='profile']",
+        "a[href*='Profile']",
         "div[class*='member']",
         "div[class*='result']",
         ".card",
@@ -136,17 +122,32 @@ async def debug_page_preview(page):
         print(f"Could not print page preview: {e}")
 
 
+async def click_first(page, selectors):
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                await loc.first.click()
+                return True
+        except:
+            pass
+    return False
+
+
 async def login(page):
     print("Opening login page...")
     await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(2500)
+    await page.wait_for_timeout(3000)
+
+    print(f"Login page URL: {page.url}")
+    await save_page_html(page, "debug_login_page.html")
 
     username_selectors = [
         'input[name="username"]',
+        'input[name="email"]',
         'input[type="email"]',
-        'input[placeholder*="Email"]',
         'input[placeholder*="Username"]',
-        'input[name*="email"]',
+        'input[placeholder*="Email"]',
     ]
     password_selectors = [
         'input[name="password"]',
@@ -155,76 +156,92 @@ async def login(page):
 
     username_selector = None
     for sel in username_selectors:
-        if await page.locator(sel).count() > 0:
-            username_selector = sel
-            break
+        try:
+            if await page.locator(sel).count() > 0:
+                username_selector = sel
+                break
+        except:
+            pass
 
     password_selector = None
     for sel in password_selectors:
-        if await page.locator(sel).count() > 0:
-            password_selector = sel
-            break
+        try:
+            if await page.locator(sel).count() > 0:
+                password_selector = sel
+                break
+        except:
+            pass
 
     if not username_selector or not password_selector:
-        raise Exception("Could not locate login inputs.")
+        await debug_page_preview(page)
+        raise Exception("Could not locate login inputs on BNI login page.")
 
-    print(f'Using username selector: {username_selector}')
-    print(f'Using password selector: {password_selector}')
+    print(f"Using username selector: {username_selector}")
+    print(f"Using password selector: {password_selector}")
 
     await page.fill(username_selector, EMAIL)
     await page.fill(password_selector, PASSWORD)
 
     login_button_selectors = [
         'button[type="submit"]',
+        'input[type="submit"]',
         'button:has-text("Login")',
         'button:has-text("Sign In")',
-        'input[type="submit"]',
+        'button:has-text("SIGN IN")',
+        'button:has-text("Submit")',
     ]
 
-    clicked = False
-    for sel in login_button_selectors:
-        try:
-            if await page.locator(sel).count() > 0:
-                await page.locator(sel).first.click()
-                clicked = True
-                break
-        except:
-            pass
-
+    clicked = await click_first(page, login_button_selectors)
     if not clicked:
         raise Exception("Could not click login button.")
 
-    await page.wait_for_load_state("domcontentloaded")
-    await page.wait_for_timeout(5000)
+    await page.wait_for_timeout(6000)
 
-    print("✓ Login successful")
+    # Sometimes BNI stays on /web/, sometimes redirects into /v2/
     print(f"Post-login URL: {page.url}")
+    await save_page_html(page, "debug_after_login.html")
+
+    # Optional: handle popups/consent if present
+    await click_first(page, [
+        'button:has-text("Continue")',
+        'button:has-text("OK")',
+        'button:has-text("Allow")',
+        'button:has-text("Close")',
+        'button[aria-label="Close"]',
+    ])
+
+    print("✓ Login flow completed")
 
 
 async def open_search_page(page):
-    print("Opening search page...")
+    print("Opening search/dashboard page...")
     for url in SEARCH_URL_CANDIDATES:
         try:
             await page.goto(url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2500)
-            print(f"Opened search candidate URL: {url}")
+            await page.wait_for_timeout(4000)
+            print(f"Opened candidate URL: {url}")
+            print(f"Current URL: {page.url}")
+            await save_page_html(page, "debug_search_landing.html")
             return
-        except:
+        except Exception as e:
+            print(f"Failed candidate URL {url}: {e}")
             continue
 
-    raise Exception("Could not open search page.")
+    raise Exception("Could not open search/dashboard page.")
 
 
 async def search_city(page, city):
     print(f"Searching city: {city}")
 
+    # Try to locate search/filter inputs
     search_input_selectors = [
         'input[placeholder*="Search"]',
+        'input[placeholder*="search"]',
+        'input[placeholder*="City"]',
+        'input[placeholder*="city"]',
         'input[type="search"]',
         'input[name*="search"]',
         'input[name*="city"]',
-        'input[placeholder*="City"]',
-        'input',
     ]
 
     search_box = None
@@ -232,13 +249,26 @@ async def search_city(page, city):
         try:
             loc = page.locator(sel)
             if await loc.count() > 0:
-                search_box = loc.first
-                break
+                # choose first visible input
+                count = await loc.count()
+                for i in range(count):
+                    try:
+                        if await loc.nth(i).is_visible():
+                            search_box = loc.nth(i)
+                            break
+                    except:
+                        pass
+                if search_box:
+                    break
         except:
             pass
 
     if not search_box:
-        raise Exception("Could not find search input.")
+        print("Could not find a dedicated city search input. Printing preview.")
+        await debug_page_preview(page)
+        await debug_selector_counts(page)
+        await save_page_html(page, "debug_no_search_input.html")
+        return
 
     await search_box.click()
     await page.keyboard.press("Control+A")
@@ -246,25 +276,19 @@ async def search_city(page, city):
     await search_box.fill(city)
     await page.wait_for_timeout(1500)
 
-    # try enter
+    # Try enter first
     try:
         await search_box.press("Enter")
     except:
         pass
 
-    # try buttons too
-    button_selectors = [
+    # Then try buttons
+    await click_first(page, [
         'button:has-text("Search")',
         'button:has-text("Apply")',
+        'button:has-text("Filter")',
         'button[type="submit"]',
-    ]
-    for sel in button_selectors:
-        try:
-            if await page.locator(sel).count() > 0:
-                await page.locator(sel).first.click()
-                break
-        except:
-            pass
+    ])
 
     await page.wait_for_timeout(5000)
     print("✓ Search completed")
@@ -303,6 +327,7 @@ async def get_result_rows(page):
     if not best_selector or best_count == 0:
         return None, 0
 
+    print(f"Best row selector: {best_selector} -> {best_count}")
     return page.locator(best_selector), best_count
 
 
@@ -334,18 +359,16 @@ async def inspect_row(row, idx):
 
 
 async def extract_basic_fields_from_row(row):
-    # broad guesses from result row
     name = ""
     chapter = ""
     company = ""
     industry = ""
     city = ""
 
-    text = ""
     try:
         text = await row.inner_text()
     except:
-        pass
+        text = ""
 
     lines = [x.strip() for x in text.split("\n") if x.strip()]
 
@@ -358,7 +381,6 @@ async def extract_basic_fields_from_row(row):
     if len(lines) > 3:
         industry = lines[3]
 
-    # extra selector-based attempts
     candidate_name_selectors = [
         "a",
         "strong",
@@ -410,11 +432,10 @@ async def get_profile_link_from_row(row, current_url):
                 except:
                     pass
 
-                if href:
+                if href and "javascript:" not in href.lower():
                     full = urljoin(current_url, href)
-                    if "javascript:" not in href.lower():
-                        print(f"Candidate profile link found | text={txt} | href={href} | full={full}")
-                        return full
+                    print(f"Candidate profile link found | text={txt} | href={href} | full={full}")
+                    return full
         except:
             pass
 
@@ -422,19 +443,16 @@ async def get_profile_link_from_row(row, current_url):
 
 
 async def open_profile(page, row, profile_url, name):
-    # First try direct goto
     if profile_url:
         try:
             print(f"Opening profile via direct URL: {profile_url}")
             await page.goto(profile_url, wait_until="domcontentloaded")
             await page.wait_for_timeout(3500)
-            if page.url != profile_url or True:
-                print(f"✓ Profile opened via URL for: {name}")
-                return True
+            print(f"✓ Profile opened via URL for: {name}")
+            return True
         except Exception as e:
             print(f"Direct URL open failed for {name}: {e}")
 
-    # Fallback: click first anchor inside row
     try:
         link = row.locator("a").first
         if await link.count() > 0:
@@ -451,7 +469,6 @@ async def open_profile(page, row, profile_url, name):
 
 
 async def extract_profile_value_by_label(page, labels):
-    body_text = ""
     try:
         body_text = await page.locator("body").inner_text()
     except:
@@ -466,6 +483,7 @@ async def extract_profile_value_by_label(page, labels):
                     return lines[i + 1]
             if line.lower().startswith(label.lower() + ":"):
                 return line.split(":", 1)[1].strip()
+
     return ""
 
 
@@ -482,7 +500,6 @@ async def extract_profile(page, city_hint, profile_url):
     website = ""
     address = ""
 
-    # name guesses
     for sel in ["h1", "h2", "h3", '[class*="name"]', "strong", "title"]:
         try:
             loc = page.locator(sel)
@@ -494,7 +511,6 @@ async def extract_profile(page, city_hint, profile_url):
         except:
             pass
 
-    # email from mailto
     try:
         mailto = page.locator('a[href^="mailto:"]').first
         if await mailto.count() > 0:
@@ -504,7 +520,15 @@ async def extract_profile(page, city_hint, profile_url):
     except:
         pass
 
-    # website from http links excluding BNI links
+    try:
+        tel = page.locator('a[href^="tel:"]').first
+        if await tel.count() > 0:
+            href = await tel.get_attribute("href")
+            if href:
+                contact = href.replace("tel:", "").strip()
+    except:
+        pass
+
     try:
         links = await page.locator("a").evaluate_all(
             """els => els.map(a => a.href).filter(Boolean)"""
@@ -517,17 +541,6 @@ async def extract_profile(page, city_hint, profile_url):
     except:
         pass
 
-    # contact from tel link
-    try:
-        tel = page.locator('a[href^="tel:"]').first
-        if await tel.count() > 0:
-            href = await tel.get_attribute("href")
-            if href:
-                contact = href.replace("tel:", "").strip()
-    except:
-        pass
-
-    # label-based fallback
     if not contact:
         contact = await extract_profile_value_by_label(page, ["Phone", "Mobile", "Contact", "Telephone"])
     if not email:
@@ -577,12 +590,10 @@ async def process_city(page, city):
     collected = []
     seen_profile_urls = set()
 
-    # Limit for debug phase; increase later
     max_rows = min(row_count, 20)
 
     for i in range(max_rows):
         try:
-            # Important: re-fetch search page each iteration to avoid stale row references
             if i > 0:
                 await open_search_page(page)
                 await search_city(page, city)
@@ -622,7 +633,6 @@ async def process_city(page, city):
 
             data = await extract_profile(page, city, profile_url)
 
-            # fill empty profile fields from result row if needed
             if not data["Name"]:
                 data["Name"] = basic["name"]
             if not data["Chapter"]:
