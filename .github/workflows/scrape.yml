@@ -1,0 +1,39 @@
+name: BNI Scraper
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run scraper
+        env:
+          BNI_EMAIL: ${{ secrets.BNI_EMAIL }}
+          BNI_PASSWORD: ${{ secrets.BNI_PASSWORD }}
+          BNI_CITY: ${{ secrets.BNI_CITY }}
+          GOOGLE_WEBAPP_URL: ${{ secrets.GOOGLE_WEBAPP_URL }}
+          HEADLESS: "true"
+        run: python scraper.py
+
+      - name: Upload CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: bni-data
+          path: "*.csv"
