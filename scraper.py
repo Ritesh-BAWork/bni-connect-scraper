@@ -2,7 +2,7 @@ import csv
 import os
 import re
 import time
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Set
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -21,12 +21,8 @@ SEARCH_URL = "https://www.bniconnectglobal.com/web/dashboard/search"
 
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 SLOW_MO = int(os.getenv("SLOW_MO", "250"))
-
 CSV_FILE = os.getenv("CSV_FILE", "bni_members.csv")
-
 GOOGLE_WEBAPP_URL = os.getenv("GOOGLE_WEBAPP_URL", "").strip()
-
-# optional debugging
 DEBUG_HTML = os.getenv("DEBUG_HTML", "true").lower() == "true"
 
 
@@ -91,15 +87,29 @@ def append_csv(row: Dict) -> None:
         csv.writer(f).writerow([row.get(h, "") for h in HEADERS])
 
 
-def post_to_google_sheet_apps_script(row: Dict) -> None:
+def post_rows_to_google_sheet(rows: List[Dict]) -> None:
     if not GOOGLE_WEBAPP_URL or GOOGLE_WEBAPP_URL == "YOUR_URL":
+        print("ℹ️ GOOGLE_WEBAPP_URL not set. Skipping Google Sheet upload.")
         return
-    try:
-        payload = {"rows": [row]}
-        r = requests.post(GOOGLE_WEBAPP_URL, json=payload, timeout=60)
-        print(f"📤 Apps Script POST: {r.status_code}")
-    except Exception as e:
-        print(f"⚠️ Apps Script POST failed: {e}")
+
+    if not rows:
+        return
+
+    payload = {"rows": rows}
+
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(GOOGLE_WEBAPP_URL, json=payload, timeout=60)
+            print(f"📤 Apps Script POST status: {r.status_code}")
+            print(f"📤 Apps Script response: {r.text[:200]}")
+            if r.ok:
+                return
+        except Exception as e:
+            print(f"⚠️ POST failed (attempt {attempt}): {e}")
+
+        time.sleep(2)
+
+    print("❌ Failed to push data to Google Sheet")
 
 
 def click_first_visible(page, selectors: List[str], timeout_ms: int = 3000) -> bool:
@@ -130,7 +140,11 @@ def fill_first_visible(page, selectors: List[str], value: str, press_enter: bool
                     el = locator.nth(i)
                     if el.is_visible(timeout=1000):
                         el.click(timeout=2000)
-                        el.fill("")
+                        try:
+                            el.press("Control+A")
+                            el.press("Backspace")
+                        except Exception:
+                            pass
                         el.fill(value)
                         if press_enter:
                             el.press("Enter")
@@ -202,19 +216,17 @@ def login(page) -> None:
 
 
 # =========================================================
-# HUMAN-LIKE SEARCH PAGE OPEN
+# OPEN SEARCH PAGE
 # =========================================================
 def open_real_search_page(page) -> None:
     print("🧭 Opening Search Members page...")
 
-    # Start from current dashboard or go there.
     if "/web/dashboard" not in page.url:
         page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
         page.wait_for_timeout(3000)
 
     save_html(page, "debug_dashboard_before_search_click.html")
 
-    # Try clicking like a human from dashboard/menu first
     clicked = click_first_visible(
         page,
         [
@@ -242,10 +254,6 @@ def open_real_search_page(page) -> None:
 
     save_html(page, "debug_search_page_opened.html")
 
-    # Final guard
-    if "/web/dashboard/search" not in page.url:
-        print(f"ℹ️ Current search-page URL: {page.url}")
-
 
 # =========================================================
 # SEARCH CITY
@@ -271,7 +279,6 @@ def search_city(page, city: str) -> None:
         save_html(page, f"debug_no_search_input_{city}.html")
         raise Exception(f"Could not find search input for city: {city}")
 
-    # optional button click too
     click_first_visible(
         page,
         [
@@ -289,7 +296,7 @@ def search_city(page, city: str) -> None:
 
 
 # =========================================================
-# TOTAL ROWS / MEMBERS READ
+# RESULT READING
 # =========================================================
 def read_total_rows_text(page) -> str:
     candidates = [
@@ -310,14 +317,10 @@ def read_total_rows_text(page) -> str:
 
 
 def get_members(page, city: str) -> List[Dict]:
-    # Based on your reference script structure:
-    # row container class includes css-1rb62l
-    # profile link pattern includes networkHome?userId
     results = page.evaluate(
         """
         (searchCity) => {
             const members = [];
-
             const rows = Array.from(document.querySelectorAll('div'))
                 .filter(el => {
                     const c = (el.className || '').toString();
@@ -330,10 +333,7 @@ def get_members(page, city: str) -> List[Dict]:
 
                 const name = (link.innerText || '').replace(/\\s+/g, ' ').trim();
                 let href = link.getAttribute('href') || '';
-                if (href.startsWith('/')) {
-                    href = 'https://www.bniconnectglobal.com' + href;
-                }
-
+                if (href.startsWith('/')) href = 'https://www.bniconnectglobal.com' + href;
                 if (!name || !href) continue;
 
                 const childTexts = Array.from(row.children)
@@ -344,8 +344,13 @@ def get_members(page, city: str) -> List[Dict]:
                 const cityVal = childTexts.find(x => x.toLowerCase() === searchCity.toLowerCase()) || searchCity;
                 const industry = childTexts.find(x => x.includes('>')) || '';
 
-                const used = new Set([name, chapter, cityVal, industry, '', 'Connect', '+']);
-                const company = childTexts.find(x => !used.has(x)) || '';
+                let company = '';
+                for (const x of childTexts) {
+                    if (x !== chapter && x !== cityVal && x !== industry) {
+                        company = x;
+                        break;
+                    }
+                }
 
                 members.push({
                     name,
@@ -374,16 +379,16 @@ def get_members(page, city: str) -> List[Dict]:
         href = norm(r.get("href", ""))
         if not name or not href:
             continue
-        cleaned.append(
-            {
-                "name": name,
-                "href": href,
-                "chapter": norm(r.get("chapter", "")),
-                "company": norm(r.get("company", "")),
-                "city": norm(r.get("city", "")) or city,
-                "industry": norm(r.get("industry", "")),
-            }
-        )
+
+        cleaned.append({
+            "name": name,
+            "href": href,
+            "chapter": norm(r.get("chapter", "")),
+            "company": norm(r.get("company", "")),
+            "city": norm(r.get("city", "")) or city,
+            "industry": norm(r.get("industry", "")),
+        })
+
     return cleaned
 
 
@@ -475,6 +480,7 @@ def extract_profile(page) -> Dict:
                 ):
                     addr_candidates.append(candidate)
                     break
+
     if addr_candidates:
         det["Address"] = addr_candidates[0]
 
@@ -483,20 +489,9 @@ def extract_profile(page) -> Dict:
             if any(
                 k in line.lower()
                 for k in [
-                    "road",
-                    "nagar",
-                    "tower",
-                    "complex",
-                    "floor",
-                    "lane",
-                    "building",
-                    "colony",
-                    "plot",
-                    "apartment",
-                    "ward",
-                    "sector",
-                    "phase",
-                    "deo",
+                    "road", "nagar", "tower", "complex", "floor", "lane",
+                    "building", "colony", "plot", "apartment", "ward",
+                    "sector", "phase", "deo"
                 ]
             ):
                 det["Address"] = line
@@ -536,7 +531,7 @@ def extract_profile(page) -> Dict:
 
 
 # =========================================================
-# ONE CITY FLOW
+# ONE CITY PROCESS
 # =========================================================
 def process_city(page, city: str, done_urls: Set[str], all_rows: List[Dict]) -> None:
     open_real_search_page(page)
@@ -598,11 +593,10 @@ def process_city(page, city: str, done_urls: Set[str], all_rows: List[Dict]) -> 
             print(f"   Classification : {final['Professional Classification']}")
 
             append_csv(final)
-            post_to_google_sheet_apps_script(final)
+            post_rows_to_google_sheet([final])
             all_rows.append(final)
             new_this_round += 1
 
-            # go back to results and continue
             try:
                 page.go_back(wait_until="domcontentloaded", timeout=15000)
                 page.wait_for_timeout(2500)
@@ -678,7 +672,7 @@ def main():
         print(f"🎉 DONE! Total members saved: {len(all_rows)}")
         print(f"📄 CSV: {CSV_FILE}")
         if GOOGLE_WEBAPP_URL and GOOGLE_WEBAPP_URL != "YOUR_URL":
-            print("📤 Apps Script posting was enabled")
+            print("📤 Google Sheet posting was enabled")
         print("=" * 70)
 
         input("\nPress ENTER to close browser...")
