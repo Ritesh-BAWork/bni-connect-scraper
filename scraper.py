@@ -1,768 +1,697 @@
 import os
+import re
 import csv
-import json
-import asyncio
-from urllib.parse import urljoin
+import time
+import requests
+from typing import List, Dict, Set
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from playwright.async_api import async_playwright
+LOGIN_URL = "https://www.bniconnectglobal.com/login/"
 
-try:
-    import requests
-except ImportError:
-    requests = None
+BNI_EMAIL = os.getenv("BNI_EMAIL")
+BNI_PASSWORD = os.getenv("BNI_PASSWORD")
 
+CITIES_RAW = os.getenv(
+    "BNI_CITIES",
+    "Nagpur,Bangalore,Pune"
+)
+CITIES = [c.strip() for c in CITIES_RAW.split(",") if c.strip()]
 
-# =========================
-# CONFIG
-# =========================
-LOGIN_URL = "https://www.bniconnectglobal.com/web/"
-SEARCH_URL_CANDIDATES = [
-    "https://www.bniconnectglobal.com/web/dashboard",
-    "https://www.bniconnectglobal.com/web/",
-]
+GOOGLE_WEBAPP_URL = os.getenv("GOOGLE_WEBAPP_URL", "").strip()
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 
-BASE_URL = "https://www.bniconnectglobal.com"
 CSV_FILE = "bni_multi_city_owners.csv"
 
-EMAIL = os.getenv("BNI_EMAIL", "").strip()
-PASSWORD = os.getenv("BNI_PASSWORD", "").strip()
-CITIES = [c.strip() for c in os.getenv("BNI_CITIES", "Nagpur").split(",") if c.strip()]
-HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-GOOGLE_WEBAPP_URL = os.getenv("GOOGLE_WEBAPP_URL", "").strip()
+HEADERS = [
+    "Name",
+    "Chapter",
+    "Company",
+    "City",
+    "Industry and Classification",
+    "Contact",
+    "Mail",
+    "Web Page Link",
+    "Address",
+]
 
 
-# =========================
-# HELPERS
-# =========================
-def post_to_google_sheet(rows):
-    if not GOOGLE_WEBAPP_URL or GOOGLE_WEBAPP_URL == "YOUR_URL":
-        print("Google Web App URL not configured. Skipping sheet upload.")
-        return
+def sleep(ms: int):
+    time.sleep(ms / 1000)
 
-    if not requests:
-        print("requests not installed. Skipping Google Sheet upload.")
-        return
 
+def norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def ensure_env():
+    if not BNI_EMAIL or not BNI_PASSWORD:
+        raise ValueError("BNI_EMAIL or BNI_PASSWORD missing in environment variables.")
+    if not CITIES:
+        raise ValueError("No cities found in BNI_CITIES.")
+
+
+def looks_like_phone(text: str) -> bool:
+    digits = re.sub(r"\D", "", text or "")
+    return 8 <= len(digits) <= 15
+
+
+def extract_email(text: str) -> str:
+    m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", text or "")
+    return m.group(0) if m else ""
+
+
+def extract_website(text: str) -> str:
+    m = re.search(r"(https?://[^\s]+|www\.[^\s]+)", text or "", flags=re.I)
+    return m.group(0) if m else ""
+
+
+def save_html(page, filename: str):
     try:
-        payload = {"rows": rows}
-        r = requests.post(GOOGLE_WEBAPP_URL, json=payload, timeout=60)
-        print(f"Google Sheet POST status: {r.status_code}")
-        print(f"Google Sheet response: {r.text[:500]}")
-    except Exception as e:
-        print(f"Google Sheet upload failed: {e}")
-
-
-def save_csv(rows):
-    file_exists = os.path.exists(CSV_FILE)
-    fieldnames = [
-        "City",
-        "Name",
-        "Chapter",
-        "Company",
-        "Industry",
-        "Contact",
-        "Email",
-        "Website",
-        "Address",
-        "Profile URL",
-    ]
-
-    mode = "a" if file_exists else "w"
-    with open(CSV_FILE, mode, newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-
-async def save_page_html(page, filename):
-    try:
-        html = await page.content()
         with open(filename, "w", encoding="utf-8") as f:
-            f.write(html)
+            f.write(page.content())
         print(f"Saved HTML: {filename}")
     except Exception as e:
         print(f"Could not save HTML {filename}: {e}")
 
 
-async def debug_selector_counts(page):
-    selectors = [
-        "tr",
-        "tbody tr",
-        "table",
-        "div[role='row']",
-        "a[href*='member']",
-        "a[href*='Member']",
-        "a[href*='profile']",
-        "a[href*='Profile']",
-        "div[class*='member']",
-        "div[class*='Member']",
-        "div[class*='result']",
-        ".card",
-        ".search-result",
-        ".results-card",
-        ".list-group-item",
-        "input",
-        "button",
-        "select",
-        "iframe",
-    ]
-    print("\n===== SELECTOR COUNTS START =====")
-    for sel in selectors:
-        try:
-            count = await page.locator(sel).count()
-            print(f"{sel} -> {count}")
-        except Exception as e:
-            print(f"{sel} -> ERROR: {e}")
-    print("===== SELECTOR COUNTS END =====\n")
-
-
-async def debug_page_preview(page):
+def save_screenshot(page, filename: str):
     try:
-        body_text = await page.locator("body").inner_text()
-        print("===== PAGE PREVIEW START =====")
-        print(body_text[:8000])
-        print("===== PAGE PREVIEW END =====")
+        page.screenshot(path=filename, full_page=True)
+        print(f"Saved screenshot: {filename}")
     except Exception as e:
-        print(f"Could not print page preview: {e}")
+        print(f"Could not save screenshot {filename}: {e}")
 
 
-async def click_first(page, selectors):
-    for sel in selectors:
-        try:
-            loc = page.locator(sel)
-            count = await loc.count()
-            for i in range(count):
-                try:
-                    el = loc.nth(i)
-                    if await el.is_visible():
-                        await el.click()
-                        return True
-                except:
-                    pass
-        except:
-            pass
-    return False
+def init_csv():
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(HEADERS)
 
 
-async def inspect_iframes(page):
+def append_csv(row: Dict[str, str]):
+    with open(CSV_FILE, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            row.get("Name", ""),
+            row.get("Chapter", ""),
+            row.get("Company", ""),
+            row.get("City", ""),
+            row.get("Industry and Classification", ""),
+            row.get("Contact", ""),
+            row.get("Mail", ""),
+            row.get("Web Page Link", ""),
+            row.get("Address", ""),
+        ])
+
+
+def post_rows_to_google(rows: List[Dict[str, str]]):
+    if not GOOGLE_WEBAPP_URL or not rows:
+        return
     try:
-        frames = page.frames
-        print(f"Total frames: {len(frames)}")
-        for i, frame in enumerate(frames):
+        r = requests.post(GOOGLE_WEBAPP_URL, json=rows, timeout=60)
+        print("Google Sheet response:", r.text[:500])
+    except Exception as e:
+        print("Google Sheet post failed:", e)
+
+
+def wait_for_any(page, selectors: List[str], timeout_ms: int = 30000) -> str:
+    start = time.time()
+    while (time.time() - start) * 1000 < timeout_ms:
+        for selector in selectors:
             try:
-                print(f"Frame {i}: name={frame.name} url={frame.url}")
-            except:
+                if page.locator(selector).count() > 0:
+                    return selector
+            except Exception:
                 pass
-    except Exception as e:
-        print(f"Could not inspect frames: {e}")
+        sleep(500)
+    raise RuntimeError(f"None of these selectors appeared: {selectors}")
 
 
-async def login(page):
+def login(page):
     print("Opening login page...")
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(3000)
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+    sleep(4000)
 
-    print(f"Login page URL: {page.url}")
-    await save_page_html(page, "debug_login_page.html")
+    print("Login page URL:", page.url)
+    save_html(page, "debug_login_page.html")
 
-    username_selectors = [
+    user_selector = wait_for_any(page, [
         'input[name="username"]',
-        'input[name="email"]',
+        'input[name="Username"]',
         'input[type="email"]',
-        'input[placeholder*="Username"]',
-        'input[placeholder*="Email"]',
-    ]
-    password_selectors = [
-        'input[name="password"]',
-        'input[type="password"]',
-    ]
-
-    username_selector = None
-    for sel in username_selectors:
-        try:
-            if await page.locator(sel).count() > 0:
-                username_selector = sel
-                break
-        except:
-            pass
-
-    password_selector = None
-    for sel in password_selectors:
-        try:
-            if await page.locator(sel).count() > 0:
-                password_selector = sel
-                break
-        except:
-            pass
-
-    if not username_selector or not password_selector:
-        await debug_page_preview(page)
-        raise Exception("Could not locate login inputs on BNI login page.")
-
-    print(f"Using username selector: {username_selector}")
-    print(f"Using password selector: {password_selector}")
-
-    await page.fill(username_selector, EMAIL)
-    await page.fill(password_selector, PASSWORD)
-
-    login_button_selectors = [
-        'button[type="submit"]',
-        'input[type="submit"]',
-        'button:has-text("Login")',
-        'button:has-text("Sign In")',
-        'button:has-text("SIGN IN")',
-        'button:has-text("Submit")',
-    ]
-
-    clicked = await click_first(page, login_button_selectors)
-    if not clicked:
-        raise Exception("Could not click login button.")
-
-    await page.wait_for_timeout(6000)
-
-    print(f"Post-login URL: {page.url}")
-    await save_page_html(page, "debug_after_login.html")
-
-    await click_first(page, [
-        'button:has-text("Continue")',
-        'button:has-text("OK")',
-        'button:has-text("Allow")',
-        'button:has-text("Close")',
-        'button[aria-label="Close"]',
+        'input[type="text"]',
     ])
 
+    pass_selector = wait_for_any(page, [
+        'input[name="password"]',
+        'input[name="Password"]',
+        'input[type="password"]',
+    ])
+
+    print("Using username selector:", user_selector)
+    print("Using password selector:", pass_selector)
+
+    page.locator(user_selector).first.click()
+    page.locator(user_selector).first.fill(BNI_EMAIL)
+
+    page.locator(pass_selector).first.click()
+    page.locator(pass_selector).first.fill(BNI_PASSWORD)
+
+    submit_selector = wait_for_any(page, [
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button',
+    ], 15000)
+
+    page.locator(submit_selector).first.click()
+
+    page.wait_for_url("**/web/dashboard", timeout=40000)
+    sleep(4000)
+
+    print("Post-login URL:", page.url)
+    save_html(page, "debug_after_login.html")
+    save_screenshot(page, "debug_after_login.png")
     print("✓ Login flow completed")
 
 
-async def open_search_page(page):
-    print("Opening search/dashboard page...")
+def open_member_search_page(page) -> bool:
+    """
+    Must navigate like user from dashboard, because direct URL redirection
+    may land on /v2/dashboard instead of actual search UI.
+    """
+    print("Opening member search page from dashboard...")
 
-    for url in SEARCH_URL_CANDIDATES:
-        try:
-            await page.goto(url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(5000)
-            print(f"Opened candidate URL: {url}")
-            print(f"Current URL: {page.url}")
-
-            await save_page_html(page, "debug_search_landing.html")
-            await debug_selector_counts(page)
-            await inspect_iframes(page)
-
-            nav_selectors = [
-                'a:has-text("Member Search")',
-                'a:has-text("Members")',
-                'a:has-text("Find Members")',
-                'a:has-text("Search Members")',
-                'a:has-text("Find a Member")',
-                'a:has-text("Search")',
-                'button:has-text("Member Search")',
-                'button:has-text("Members")',
-                'button:has-text("Search")',
-                'a[href*="member"]',
-                'a[href*="Member"]',
-                'a[href*="search"]',
-                'a[href*="Search"]',
-            ]
-
-            clicked = await click_first(page, nav_selectors)
-            if clicked:
-                await page.wait_for_timeout(5000)
-                print(f"Navigated after member-search click: {page.url}")
-                await save_page_html(page, "debug_member_search_page.html")
-                await debug_selector_counts(page)
-            else:
-                print("Could not find member search link from dashboard. Staying on current page.")
-
-            return
-        except Exception as e:
-            print(f"Failed candidate URL {url}: {e}")
-            continue
-
-    raise Exception("Could not open search/dashboard page.")
-
-
-async def search_city(page, city):
-    print(f"Searching city: {city}")
-
-    await page.wait_for_timeout(3000)
-    await save_page_html(page, "debug_before_city_search.html")
-
-    search_input_selectors = [
-        'input[placeholder*="City"]',
-        'input[placeholder*="city"]',
-        'input[name*="city"]',
-        'input[placeholder*="Search"]',
-        'input[placeholder*="search"]',
-        'input[type="search"]',
-        'input[name*="search"]',
+    candidate_urls = [
+        "https://www.bniconnectglobal.com/web/dashboard",
+        "https://www.bniconnectglobal.com/web/dashboard/search",
     ]
 
-    search_box = None
+    for url in candidate_urls:
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            sleep(3000)
+            print("Tried URL:", page.url)
+        except Exception as e:
+            print("Candidate URL failed:", url, e)
+
+    save_html(page, "debug_search_landing.html")
+    save_screenshot(page, "debug_search_landing.png")
+
+    # First: maybe search box is already present
+    search_input_selectors = [
+        'input[type="search"]',
+        'input[placeholder*="search" i]',
+        'input[placeholder*="city" i]',
+        'input[type="text"]'
+    ]
+
     for sel in search_input_selectors:
         try:
-            loc = page.locator(sel)
-            count = await loc.count()
-            for i in range(count):
-                try:
-                    el = loc.nth(i)
-                    if await el.is_visible():
-                        search_box = el
-                        print(f"Using search input selector: {sel}")
-                        break
-                except:
-                    pass
-            if search_box:
-                break
-        except:
+            if page.locator(sel).count() > 0:
+                print("Search input already visible using selector:", sel)
+                return True
+        except Exception:
             pass
 
-    if not search_box:
+    # Try clicking obvious search / search members controls
+    click_candidates = [
+        'button:has-text("Search Members")',
+        'a:has-text("Search Members")',
+        'text="Search Members"',
+        '[aria-label*="search" i]',
+        '[title*="search" i]',
+        'button:has(svg)',
+        'a:has(svg)',
+    ]
+
+    for sel in click_candidates:
         try:
-            inputs = await page.locator("input").evaluate_all(
-                """els => els.map((el, i) => ({
-                    index: i,
-                    type: el.getAttribute('type'),
-                    name: el.getAttribute('name'),
-                    placeholder: el.getAttribute('placeholder'),
-                    value: el.value || ''
-                }))"""
-            )
-            print("Input inspection:")
-            print(json.dumps(inputs[:100], ensure_ascii=False, indent=2))
-        except Exception as e:
-            print(f"Could not inspect inputs: {e}")
+            count = page.locator(sel).count()
+            if count == 0:
+                continue
 
-        print("Could not find a dedicated city search input. Printing preview.")
-        await debug_page_preview(page)
-        await debug_selector_counts(page)
-        await inspect_iframes(page)
-        await save_page_html(page, "debug_no_search_input.html")
-        return
+            for i in range(min(count, 10)):
+                try:
+                    loc = page.locator(sel).nth(i)
+                    loc.scroll_into_view_if_needed(timeout=3000)
+                    loc.click(timeout=3000)
+                    sleep(3000)
 
-    await search_box.click()
-    await page.keyboard.press("Control+A")
-    await page.keyboard.press("Backspace")
-    await search_box.fill(city)
-    await page.wait_for_timeout(1500)
+                    for input_sel in search_input_selectors:
+                        if page.locator(input_sel).count() > 0:
+                            print(f"Opened search page by clicking {sel} [{i}]")
+                            return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
+    # Try text-based click by page JS
     try:
-        await search_box.press("Enter")
-    except:
+        js_clicked = page.evaluate("""
+        () => {
+            function clean(t) {
+                return (t || '').replace(/\\s+/g, ' ').trim();
+            }
+            const els = Array.from(document.querySelectorAll('a, button, div, span'));
+            for (const el of els) {
+                const txt = clean(el.innerText || '');
+                if (txt === 'Search Members' || txt === 'Search Member') {
+                    el.scrollIntoView({behavior: 'instant', block: 'center'});
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }
+        """)
+        if js_clicked:
+            sleep(3000)
+            for sel in search_input_selectors:
+                if page.locator(sel).count() > 0:
+                    print("Opened search page using text click")
+                    return True
+    except Exception:
         pass
 
-    await click_first(page, [
-        'button:has-text("Search")',
-        'button:has-text("Apply")',
-        'button:has-text("Filter")',
-        'button[type="submit"]',
-        'a:has-text("Search")',
-    ])
-
-    await page.wait_for_timeout(6000)
-    print("✓ Search completed")
-    print(f"Results page URL: {page.url}")
-
-    await debug_selector_counts(page)
-    await debug_page_preview(page)
-    await save_page_html(page, "debug_results_page.html")
-
-
-async def get_result_rows(page):
-    candidate_selectors = [
-        "tbody tr",
-        "tr",
-        "div[role='row']",
-        ".search-result",
-        ".results-card",
-        ".list-group-item",
-        ".card",
-        "div[class*='member']",
-        "div[class*='Member']",
-        "div[class*='result']",
-        "a[href*='member']",
-        "a[href*='profile']",
-        "a[href*='Member']",
-        "a[href*='Profile']",
-    ]
-
-    best_selector = None
-    best_count = 0
-
-    for sel in candidate_selectors:
-        try:
-            count = await page.locator(sel).count()
-            if count > best_count:
-                best_count = count
-                best_selector = sel
-        except:
-            pass
-
-    if not best_selector or best_count == 0:
-        return None, 0
-
-    print(f"Best row selector: {best_selector} -> {best_count}")
-    return page.locator(best_selector), best_count
-
-
-async def inspect_row(row, idx):
-    try:
-        html = await row.evaluate("(el) => el.outerHTML")
-        with open(f"debug_row_{idx+1}.html", "w", encoding="utf-8") as f:
-            f.write(html)
-        print(f"Saved row HTML: debug_row_{idx+1}.html")
-    except Exception as e:
-        print(f"Could not save row HTML {idx+1}: {e}")
-
-    try:
-        text = await row.inner_text()
-        print(f"Row {idx+1} text preview:\n{text[:1000]}\n")
-    except Exception as e:
-        print(f"Could not read row text {idx+1}: {e}")
-
-    try:
-        links = await row.locator("a").evaluate_all(
-            """els => els.map(a => ({
-                text: (a.innerText || '').trim(),
-                href: a.getAttribute('href')
-            }))"""
-        )
-        print(f"Row {idx+1} links: {json.dumps(links, ensure_ascii=False)}")
-    except Exception as e:
-        print(f"Could not inspect row links {idx+1}: {e}")
-
-
-async def extract_basic_fields_from_row(row):
-    name = ""
-    chapter = ""
-    company = ""
-    industry = ""
-    city = ""
-
-    try:
-        text = await row.inner_text()
-    except:
-        text = ""
-
-    lines = [x.strip() for x in text.split("\n") if x.strip()]
-
-    if lines:
-        name = lines[0]
-    if len(lines) > 1:
-        chapter = lines[1]
-    if len(lines) > 2:
-        company = lines[2]
-    if len(lines) > 3:
-        industry = lines[3]
-
-    candidate_name_selectors = [
-        "a",
-        "strong",
-        "h3",
-        "h4",
-        "h5",
-        "b",
-        '[class*="name"]',
-        '[class*="title"]',
-    ]
-    for sel in candidate_name_selectors:
-        try:
-            loc = row.locator(sel)
-            if await loc.count() > 0:
-                val = await loc.first.inner_text()
-                if val and len(val.strip()) > 1:
-                    name = val.strip()
-                    break
-        except:
-            pass
-
-    return {
-        "name": name,
-        "chapter": chapter,
-        "company": company,
-        "industry": industry,
-        "city": city,
-    }
-
-
-async def get_profile_link_from_row(row, current_url):
-    link_selectors = [
-        "a[href*='profile']",
-        "a[href*='Profile']",
-        "a[href*='member']",
-        "a[href*='Member']",
-        "a",
-    ]
-
-    for sel in link_selectors:
-        try:
-            loc = row.locator(sel)
-            count = await loc.count()
-            for i in range(count):
-                href = await loc.nth(i).get_attribute("href")
-                txt = ""
-                try:
-                    txt = (await loc.nth(i).inner_text()).strip()
-                except:
-                    pass
-
-                if href and "javascript:" not in href.lower():
-                    full = urljoin(current_url, href)
-                    print(f"Candidate profile link found | text={txt} | href={href} | full={full}")
-                    return full
-        except:
-            pass
-
-    return None
-
-
-async def open_profile(page, row, profile_url, name):
-    if profile_url:
-        try:
-            print(f"Opening profile via direct URL: {profile_url}")
-            await page.goto(profile_url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(3500)
-            print(f"✓ Profile opened via URL for: {name}")
-            return True
-        except Exception as e:
-            print(f"Direct URL open failed for {name}: {e}")
-
-    try:
-        link = row.locator("a").first
-        if await link.count() > 0:
-            print(f"Trying click fallback for: {name}")
-            await link.click()
-            await page.wait_for_load_state("domcontentloaded")
-            await page.wait_for_timeout(3500)
-            print(f"✓ Profile opened via click fallback for: {name}")
-            return True
-    except Exception as e:
-        print(f"Click fallback failed for {name}: {e}")
-
+    print("Could not open real member search page.")
+    save_html(page, "debug_failed_open_search.html")
+    save_screenshot(page, "debug_failed_open_search.png")
     return False
 
 
-async def extract_profile_value_by_label(page, labels):
-    try:
-        body_text = await page.locator("body").inner_text()
-    except:
-        return ""
+def search_city(page, city_name: str):
+    ok = open_member_search_page(page)
+    if not ok:
+        print("Could not reach search page. Printing preview.")
+        preview = page.locator("body").inner_text()[:3000]
+        print("===== PAGE PREVIEW START =====")
+        print(preview)
+        print("===== PAGE PREVIEW END =====")
+        return False
 
-    lines = [x.strip() for x in body_text.split("\n") if x.strip()]
-
-    for i, line in enumerate(lines):
-        for label in labels:
-            if line.lower() == label.lower():
-                if i + 1 < len(lines):
-                    return lines[i + 1]
-            if line.lower().startswith(label.lower() + ":"):
-                return line.split(":", 1)[1].strip()
-
-    return ""
-
-
-async def extract_profile(page, city_hint, profile_url):
-    await save_page_html(page, "debug_current_profile.html")
-
-    name = ""
-    chapter = ""
-    company = ""
-    industry = ""
-    city = city_hint
-    contact = ""
-    email = ""
-    website = ""
-    address = ""
-
-    for sel in ["h1", "h2", "h3", '[class*="name"]', "strong", "title"]:
+    input_selector = None
+    for sel in [
+        'input[type="search"]',
+        'input[placeholder*="city" i]',
+        'input[placeholder*="search" i]',
+        'input[type="text"]'
+    ]:
         try:
-            loc = page.locator(sel)
-            if await loc.count() > 0:
-                value = await loc.first.inner_text()
-                if value and len(value.strip()) > 1:
-                    name = value.strip()
-                    break
-        except:
+            if page.locator(sel).count() > 0:
+                input_selector = sel
+                break
+        except Exception:
             pass
 
+    if not input_selector:
+        print("Could not find search input after opening search page.")
+        save_html(page, "debug_no_search_input.html")
+        save_screenshot(page, "debug_no_search_input.png")
+        return False
+
+    print(f"Searching city: {city_name}")
+    box = page.locator(input_selector).first
+    box.click()
+    box.fill(city_name)
+    page.keyboard.press("Enter")
+    sleep(5000)
+
+    save_html(page, f"debug_after_search_{city_name}.html")
+    save_screenshot(page, f"debug_after_search_{city_name}.png")
+    print("✓ Search completed")
+    return True
+
+
+def debug_preview(page, city_name: str):
+    preview = page.locator("body").inner_text()[:4000]
+    print(f"\n===== PAGE PREVIEW START ({city_name}) =====")
+    print(preview)
+    print(f"===== PAGE PREVIEW END ({city_name}) =====\n")
+
+
+def print_selector_counts(page):
+    selectors = [
+        "tr",
+        "tbody tr",
+        "div[role='row']",
+        "a[href*='member']",
+        "a[href*='Member']",
+        "a[href*='profile']",
+        "a[href*='Profile']",
+        "div[class*='member']",
+        "div[class*='result']",
+        ".card",
+        ".search-result",
+        ".results-card",
+        ".list-group-item",
+    ]
+    print("===== SELECTOR COUNTS START =====")
+    for sel in selectors:
+        try:
+            print(f"{sel} -> {page.locator(sel).count()}")
+        except Exception:
+            print(f"{sel} -> error")
+    print("===== SELECTOR COUNTS END =====")
+
+
+def get_visible_rows(page, city_name: str) -> List[Dict[str, str]]:
+    rows = page.evaluate(
+        """(cityName) => {
+            function clean(t) {
+              return (t || "").replace(/\\s+/g, " ").trim();
+            }
+
+            const out = [];
+            const seen = new Set();
+            const els = Array.from(document.querySelectorAll("body *"));
+
+            for (const el of els) {
+              const txt = clean(el.innerText || "");
+              if (!/^BNI\\s+/i.test(txt)) continue;
+              if (txt.length > 120) continue;
+
+              let node = el;
+              let found = null;
+
+              for (let i = 0; i < 12 && node; i++, node = node.parentElement) {
+                const block = clean(node.innerText || "");
+                if (
+                  block &&
+                  block.toLowerCase().includes(cityName.toLowerCase()) &&
+                  /BNI\\s+/i.test(block) &&
+                  block.length > 20 &&
+                  block.length < 700 &&
+                  !/Search Members/i.test(block) &&
+                  !/Search Results/i.test(block)
+                ) {
+                  found = node;
+                  break;
+                }
+              }
+
+              if (!found) continue;
+
+              const lines = (found.innerText || "")
+                .split("\\n")
+                .map(clean)
+                .filter(Boolean)
+                .filter(x => ![
+                  "Name", "Chapter", "Company", "City",
+                  "Industry and Classification", "Connect", "+"
+                ].includes(x));
+
+              if (lines.length < 4) continue;
+
+              const chapter = lines.find(x => /^BNI\\s+/i.test(x)) || "";
+              const chapterIdx = lines.indexOf(chapter);
+              let name = chapterIdx > 0 ? lines[chapterIdx - 1] : lines[0];
+              let city = lines.find(x => x.toLowerCase() === cityName.toLowerCase()) || cityName;
+              let industry = lines.find(x => x.includes(">")) || "";
+
+              let company = "";
+              for (const x of lines) {
+                if (x === name || x === chapter || x === city || x === industry) continue;
+                company = x;
+                break;
+              }
+
+              if (!name || !chapter) continue;
+
+              const key = `${name}|${chapter}|${company}|${city}|${industry}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+
+              out.push({
+                Name: name,
+                Chapter: chapter,
+                Company: company,
+                City: city,
+                "Industry and Classification": industry
+              });
+            }
+
+            return out;
+        }""",
+        city_name,
+    )
+
+    cleaned = []
+    for row in rows:
+        if row.get("Name") and row.get("Chapter"):
+            cleaned.append({
+                "Name": norm(row.get("Name", "")),
+                "Chapter": norm(row.get("Chapter", "")),
+                "Company": norm(row.get("Company", "")),
+                "City": norm(row.get("City", "")) or city_name,
+                "Industry and Classification": norm(row.get("Industry and Classification", "")),
+            })
+    return cleaned
+
+
+def click_member_name(page, target_name: str) -> bool:
+    js = """(targetName) => {
+        function clean(t) {
+          return (t || '').replace(/\\s+/g, ' ').trim();
+        }
+        const candidates = Array.from(document.querySelectorAll('a, span, div'));
+        for (const el of candidates) {
+          const txt = clean(el.innerText || '');
+          if (txt === targetName) {
+            el.scrollIntoView({behavior: 'instant', block: 'center'});
+            el.click();
+            return true;
+          }
+        }
+        return false;
+    }"""
     try:
-        mailto = page.locator('a[href^="mailto:"]').first
-        if await mailto.count() > 0:
-            href = await mailto.get_attribute("href")
-            if href:
-                email = href.replace("mailto:", "").strip()
-    except:
-        pass
+        return page.evaluate(js, target_name)
+    except Exception:
+        return False
+
+
+def extract_profile(page) -> Dict[str, str]:
+    sleep(2500)
+
+    body_text = page.locator("body").inner_text()
+    lines = [norm(x) for x in body_text.splitlines() if norm(x)]
+
+    mail = ""
+    website = ""
+    contact = ""
+    address = ""
 
     try:
-        tel = page.locator('a[href^="tel:"]').first
-        if await tel.count() > 0:
-            href = await tel.get_attribute("href")
-            if href:
-                contact = href.replace("tel:", "").strip()
-    except:
+        mailto = page.locator('a[href^="mailto:"]')
+        if mailto.count() > 0:
+            href = mailto.first.get_attribute("href") or ""
+            mail = href.replace("mailto:", "").strip()
+    except Exception:
         pass
 
+    if not mail:
+        mail = extract_email(body_text)
+
     try:
-        links = await page.locator("a").evaluate_all(
-            """els => els.map(a => a.href).filter(Boolean)"""
-        )
-        for href in links:
-            h = href.lower()
-            if h.startswith("http") and "bniconnect" not in h and "mailto:" not in h and "tel:" not in h:
+        links = page.locator("a[href]")
+        for i in range(links.count()):
+            href = (links.nth(i).get_attribute("href") or "").strip()
+            if (
+                href
+                and "bniconnectglobal.com" not in href.lower()
+                and not href.lower().startswith("mailto:")
+                and not href.startswith("#")
+            ):
                 website = href
                 break
-    except:
+    except Exception:
         pass
 
-    if not contact:
-        contact = await extract_profile_value_by_label(page, ["Phone", "Mobile", "Contact", "Telephone"])
-    if not email:
-        email = await extract_profile_value_by_label(page, ["Email", "E-mail", "Mail"])
     if not website:
-        website = await extract_profile_value_by_label(page, ["Website", "Web", "URL"])
+        website = extract_website(body_text)
+
+    phones = []
+    for line in lines:
+        if looks_like_phone(line) and line not in phones:
+            phones.append(line)
+    if phones:
+        contact = " / ".join(phones[:2])
+
+    collecting = False
+    address_lines = []
+
+    for line in lines:
+        low = line.lower()
+
+        if website and website in line:
+            collecting = True
+            continue
+
+        if collecting:
+            if low in {"city", "zip / postal code", "country"}:
+                break
+            if line in {"‹", "›", "<", ">", "Personal Details"}:
+                continue
+            address_lines.append(line)
+
+    if address_lines:
+        address = " ".join(address_lines)
+
     if not address:
-        address = await extract_profile_value_by_label(page, ["Address", "Location"])
-    if not company:
-        company = await extract_profile_value_by_label(page, ["Company", "Business", "Organization"])
-    if not chapter:
-        chapter = await extract_profile_value_by_label(page, ["Chapter"])
-    if not industry:
-        industry = await extract_profile_value_by_label(page, ["Industry", "Category", "Profession"])
-    if not city:
-        city = await extract_profile_value_by_label(page, ["City", "Location"])
+        candidates = []
+        for line in lines:
+            low = line.lower()
+            if any(k in low for k in [
+                "road", "rd", "complex", "bank", "nagar", "floor",
+                "lane", "building", "chaoni", "colony", "plot", "apartment"
+            ]):
+                candidates.append(line)
+        if candidates:
+            address = " ".join(candidates[:3])
 
     return {
-        "City": city_hint or city,
-        "Name": name,
-        "Chapter": chapter,
-        "Company": company,
-        "Industry": industry,
         "Contact": contact,
-        "Email": email,
-        "Website": website,
+        "Mail": mail,
+        "Web Page Link": website,
         "Address": address,
-        "Profile URL": profile_url or page.url,
     }
 
 
-async def process_city(page, city):
-    print("\n" + "=" * 70)
-    print(f"Processing city: {city}")
-    print("=" * 70)
-
-    await open_search_page(page)
-    await search_city(page, city)
-
-    rows_locator, row_count = await get_result_rows(page)
-    print(f"City: {city} | Round 1: visible rows = {row_count}")
-
-    if not rows_locator or row_count == 0:
-        print(f"No visible rows found for city: {city}")
-        return []
-
-    collected = []
-    seen_profile_urls = set()
-
-    max_rows = min(row_count, 20)
-
-    for i in range(max_rows):
-        try:
-            if i > 0:
-                await open_search_page(page)
-                await search_city(page, city)
-                rows_locator, row_count = await get_result_rows(page)
-                if not rows_locator or i >= row_count:
-                    print(f"Rows not available on rerender at index {i}")
-                    continue
-
-            row = rows_locator.nth(i)
-
-            await row.scroll_into_view_if_needed()
-            await page.wait_for_timeout(1000)
-
-            await inspect_row(row, i)
-
-            basic = await extract_basic_fields_from_row(row)
-            name = basic["name"] or f"Row {i+1}"
-
-            print(f"Opening profile: {name} | City: {city}")
-
-            profile_url = await get_profile_link_from_row(row, page.url)
-
-            if not profile_url:
-                print(f"Profile link not found for: {name}")
-                continue
-
-            if profile_url in seen_profile_urls:
-                print(f"Skipping duplicate profile URL: {profile_url}")
-                continue
-
-            seen_profile_urls.add(profile_url)
-
-            opened = await open_profile(page, row, profile_url, name)
-            if not opened:
-                print(f"Profile did not open: {name}")
-                continue
-
-            data = await extract_profile(page, city, profile_url)
-
-            if not data["Name"]:
-                data["Name"] = basic["name"]
-            if not data["Chapter"]:
-                data["Chapter"] = basic["chapter"]
-            if not data["Company"]:
-                data["Company"] = basic["company"]
-            if not data["Industry"]:
-                data["Industry"] = basic["industry"]
-
-            print(f"✓ Extracted: {data['Name']} | {data['Email']} | {data['Contact']}")
-            collected.append(data)
-
-            save_csv([data])
-            post_to_google_sheet([data])
-
-        except Exception as e:
-            print(f"Error on row {i+1}: {e}")
-            continue
-
-    return collected
-
-
-async def main():
-    if not EMAIL or not PASSWORD:
-        raise Exception("Missing BNI_EMAIL or BNI_PASSWORD in environment variables.")
+def main():
+    ensure_env()
+    init_csv()
 
     print("=" * 70)
     print("BNI Connect Multi-City Scraper — Starting")
-    print(f"Cities    : {', '.join(CITIES)}")
-    print(f"Email     : {EMAIL}")
-    print(f"CSV       : {CSV_FILE}")
-    print(f"Headless  : {HEADLESS}")
+    print("Cities    :", ", ".join(CITIES))
+    print("Email     :", BNI_EMAIL)
+    print("CSV       :", CSV_FILE)
+    print("Headless  :", HEADLESS)
     print("=" * 70)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS)
-        context = await browser.new_context()
-        page = await context.new_page()
+    all_rows: List[Dict[str, str]] = []
+    batch_rows: List[Dict[str, str]] = []
+    done: Set[str] = set()
 
-        try:
-            await login(page)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS)
+        page = browser.new_page()
 
-            all_rows = []
-            for city in CITIES:
-                rows = await process_city(page, city)
-                all_rows.extend(rows)
+        login(page)
 
+        for city_name in CITIES:
             print("\n" + "=" * 70)
-            print(f"Completed. Total extracted rows: {len(all_rows)}")
+            print("Processing city:", city_name)
             print("=" * 70)
 
-        finally:
-            await context.close()
-            await browser.close()
+            search_ok = search_city(page, city_name)
+            if not search_ok:
+                print("Could not search city:", city_name)
+                continue
+
+            no_new_rounds = 0
+            round_no = 0
+            did_debug = False
+
+            while True:
+                round_no += 1
+                visible_rows = get_visible_rows(page, city_name)
+                new_count = 0
+
+                print(f"City: {city_name} | Round {round_no}: visible rows = {len(visible_rows)}")
+
+                if not visible_rows and not did_debug:
+                    debug_preview(page, city_name)
+                    print_selector_counts(page)
+                    did_debug = True
+
+                for row in visible_rows:
+                    key = f"{city_name}|{row['Name']}|{row['Chapter']}|{row['Company']}"
+                    if key in done:
+                        continue
+
+                    print("Opening profile:", row["Name"], "| City:", city_name)
+                    clicked = click_member_name(page, row["Name"])
+                    if not clicked:
+                        print("Could not click:", row["Name"])
+                        continue
+
+                    try:
+                        page.wait_for_url("**/web/member**", timeout=15000)
+                    except PlaywrightTimeoutError:
+                        print("Profile did not open:", row["Name"])
+                        continue
+
+                    profile = extract_profile(page)
+
+                    final_row = {
+                        "Name": row.get("Name", ""),
+                        "Chapter": row.get("Chapter", ""),
+                        "Company": row.get("Company", ""),
+                        "City": row.get("City", city_name),
+                        "Industry and Classification": row.get("Industry and Classification", ""),
+                        "Contact": profile.get("Contact", ""),
+                        "Mail": profile.get("Mail", ""),
+                        "Web Page Link": profile.get("Web Page Link", ""),
+                        "Address": profile.get("Address", ""),
+                    }
+
+                    print(final_row)
+
+                    all_rows.append(final_row)
+                    batch_rows.append(final_row)
+                    done.add(key)
+                    new_count += 1
+
+                    append_csv(final_row)
+
+                    if len(batch_rows) >= 10:
+                        post_rows_to_google(batch_rows)
+                        batch_rows = []
+
+                    page.go_back(wait_until="domcontentloaded")
+                    sleep(2500)
+
+                    # reopen search page if back lands elsewhere
+                    if "/search" not in page.url.lower():
+                        search_ok = search_city(page, city_name)
+                        if not search_ok:
+                            break
+
+                if new_count == 0:
+                    no_new_rounds += 1
+                else:
+                    no_new_rounds = 0
+
+                if no_new_rounds >= 3:
+                    print(f"No new members found for {city_name}. Moving to next city.")
+                    break
+
+                page.evaluate("window.scrollBy(0, 2500)")
+                sleep(1500)
+
+                page.evaluate(
+                    """() => {
+                        const els = Array.from(document.querySelectorAll("div"));
+                        for (const el of els) {
+                            const style = window.getComputedStyle(el);
+                            const canScroll =
+                              (style.overflowY === "auto" || style.overflowY === "scroll") &&
+                              el.scrollHeight > el.clientHeight;
+                            if (canScroll) el.scrollTop = el.scrollTop + 1500;
+                        }
+                    }"""
+                )
+                sleep(1500)
+
+        if batch_rows:
+            post_rows_to_google(batch_rows)
+
+        print(f"\nCompleted. Total extracted rows: {len(all_rows)}")
+        browser.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
