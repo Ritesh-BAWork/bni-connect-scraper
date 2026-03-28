@@ -100,8 +100,8 @@ def post_rows_to_google_sheet(rows: List[Dict]) -> None:
     for attempt in range(1, 4):
         try:
             r = requests.post(GOOGLE_WEBAPP_URL, json=payload, timeout=60)
-            print(f"📤 Apps Script POST status: {r.status_code}")
-            print(f"📤 Apps Script response: {r.text[:200]}")
+            print(f"📤 Apps Script POST: {r.status_code}")
+            print(f"📤 Response: {r.text[:200]}")
             if r.ok:
                 return
         except Exception as e:
@@ -561,12 +561,13 @@ def process_city(page, city: str, done_urls: Set[str], all_rows: List[Dict]) -> 
 
     print(f"📥 Collecting all member links for {city} before opening profiles...")
 
-    collected_members = []
-    seen_urls_this_city = set()
+    collected_members: List[Dict] = []
+    seen_urls_this_city: Set[str] = set()
     stable_rounds = 0
     previous_count = 0
+    max_scroll_rounds = 200
 
-    while True:
+    for _ in range(max_scroll_rounds):
         members = get_members(page, city)
 
         for m in members:
@@ -709,18 +710,10 @@ def main():
         if GOOGLE_WEBAPP_URL and GOOGLE_WEBAPP_URL != "YOUR_URL":
             print("📤 Google Sheet posting was enabled")
         print("=" * 70)
-        
-print("\nClosing browser...")
 
-try:
-    context.close()
-except:
-    pass
-
-try:
-    browser.close()
-except:
-    pass
+        print("\nClosing browser...")
+        context.close()
+        browser.close()
 
 
 if __name__ == "__main__":
