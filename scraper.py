@@ -17,7 +17,7 @@ except ImportError:
 # =========================
 LOGIN_URL = "https://www.bniconnectglobal.com/web/"
 SEARCH_URL_CANDIDATES = [
-    "https://www.bniconnectglobal.com/v2/dashboard",
+    "https://www.bniconnectglobal.com/web/dashboard",
     "https://www.bniconnectglobal.com/web/",
 ]
 
@@ -90,17 +90,23 @@ async def debug_selector_counts(page):
     selectors = [
         "tr",
         "tbody tr",
+        "table",
         "div[role='row']",
         "a[href*='member']",
         "a[href*='Member']",
         "a[href*='profile']",
         "a[href*='Profile']",
         "div[class*='member']",
+        "div[class*='Member']",
         "div[class*='result']",
         ".card",
         ".search-result",
         ".results-card",
         ".list-group-item",
+        "input",
+        "button",
+        "select",
+        "iframe",
     ]
     print("\n===== SELECTOR COUNTS START =====")
     for sel in selectors:
@@ -126,12 +132,31 @@ async def click_first(page, selectors):
     for sel in selectors:
         try:
             loc = page.locator(sel)
-            if await loc.count() > 0:
-                await loc.first.click()
-                return True
+            count = await loc.count()
+            for i in range(count):
+                try:
+                    el = loc.nth(i)
+                    if await el.is_visible():
+                        await el.click()
+                        return True
+                except:
+                    pass
         except:
             pass
     return False
+
+
+async def inspect_iframes(page):
+    try:
+        frames = page.frames
+        print(f"Total frames: {len(frames)}")
+        for i, frame in enumerate(frames):
+            try:
+                print(f"Frame {i}: name={frame.name} url={frame.url}")
+            except:
+                pass
+    except Exception as e:
+        print(f"Could not inspect frames: {e}")
 
 
 async def login(page):
@@ -197,11 +222,9 @@ async def login(page):
 
     await page.wait_for_timeout(6000)
 
-    # Sometimes BNI stays on /web/, sometimes redirects into /v2/
     print(f"Post-login URL: {page.url}")
     await save_page_html(page, "debug_after_login.html")
 
-    # Optional: handle popups/consent if present
     await click_first(page, [
         'button:has-text("Continue")',
         'button:has-text("OK")',
@@ -215,13 +238,43 @@ async def login(page):
 
 async def open_search_page(page):
     print("Opening search/dashboard page...")
+
     for url in SEARCH_URL_CANDIDATES:
         try:
             await page.goto(url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(4000)
+            await page.wait_for_timeout(5000)
             print(f"Opened candidate URL: {url}")
             print(f"Current URL: {page.url}")
+
             await save_page_html(page, "debug_search_landing.html")
+            await debug_selector_counts(page)
+            await inspect_iframes(page)
+
+            nav_selectors = [
+                'a:has-text("Member Search")',
+                'a:has-text("Members")',
+                'a:has-text("Find Members")',
+                'a:has-text("Search Members")',
+                'a:has-text("Find a Member")',
+                'a:has-text("Search")',
+                'button:has-text("Member Search")',
+                'button:has-text("Members")',
+                'button:has-text("Search")',
+                'a[href*="member"]',
+                'a[href*="Member"]',
+                'a[href*="search"]',
+                'a[href*="Search"]',
+            ]
+
+            clicked = await click_first(page, nav_selectors)
+            if clicked:
+                await page.wait_for_timeout(5000)
+                print(f"Navigated after member-search click: {page.url}")
+                await save_page_html(page, "debug_member_search_page.html")
+                await debug_selector_counts(page)
+            else:
+                print("Could not find member search link from dashboard. Staying on current page.")
+
             return
         except Exception as e:
             print(f"Failed candidate URL {url}: {e}")
@@ -233,40 +286,58 @@ async def open_search_page(page):
 async def search_city(page, city):
     print(f"Searching city: {city}")
 
-    # Try to locate search/filter inputs
+    await page.wait_for_timeout(3000)
+    await save_page_html(page, "debug_before_city_search.html")
+
     search_input_selectors = [
-        'input[placeholder*="Search"]',
-        'input[placeholder*="search"]',
         'input[placeholder*="City"]',
         'input[placeholder*="city"]',
+        'input[name*="city"]',
+        'input[placeholder*="Search"]',
+        'input[placeholder*="search"]',
         'input[type="search"]',
         'input[name*="search"]',
-        'input[name*="city"]',
     ]
 
     search_box = None
     for sel in search_input_selectors:
         try:
             loc = page.locator(sel)
-            if await loc.count() > 0:
-                # choose first visible input
-                count = await loc.count()
-                for i in range(count):
-                    try:
-                        if await loc.nth(i).is_visible():
-                            search_box = loc.nth(i)
-                            break
-                    except:
-                        pass
-                if search_box:
-                    break
+            count = await loc.count()
+            for i in range(count):
+                try:
+                    el = loc.nth(i)
+                    if await el.is_visible():
+                        search_box = el
+                        print(f"Using search input selector: {sel}")
+                        break
+                except:
+                    pass
+            if search_box:
+                break
         except:
             pass
 
     if not search_box:
+        try:
+            inputs = await page.locator("input").evaluate_all(
+                """els => els.map((el, i) => ({
+                    index: i,
+                    type: el.getAttribute('type'),
+                    name: el.getAttribute('name'),
+                    placeholder: el.getAttribute('placeholder'),
+                    value: el.value || ''
+                }))"""
+            )
+            print("Input inspection:")
+            print(json.dumps(inputs[:100], ensure_ascii=False, indent=2))
+        except Exception as e:
+            print(f"Could not inspect inputs: {e}")
+
         print("Could not find a dedicated city search input. Printing preview.")
         await debug_page_preview(page)
         await debug_selector_counts(page)
+        await inspect_iframes(page)
         await save_page_html(page, "debug_no_search_input.html")
         return
 
@@ -276,21 +347,20 @@ async def search_city(page, city):
     await search_box.fill(city)
     await page.wait_for_timeout(1500)
 
-    # Try enter first
     try:
         await search_box.press("Enter")
     except:
         pass
 
-    # Then try buttons
     await click_first(page, [
         'button:has-text("Search")',
         'button:has-text("Apply")',
         'button:has-text("Filter")',
         'button[type="submit"]',
+        'a:has-text("Search")',
     ])
 
-    await page.wait_for_timeout(5000)
+    await page.wait_for_timeout(6000)
     print("✓ Search completed")
     print(f"Results page URL: {page.url}")
 
@@ -309,7 +379,12 @@ async def get_result_rows(page):
         ".list-group-item",
         ".card",
         "div[class*='member']",
+        "div[class*='Member']",
         "div[class*='result']",
+        "a[href*='member']",
+        "a[href*='profile']",
+        "a[href*='Member']",
+        "a[href*='Profile']",
     ]
 
     best_selector = None
