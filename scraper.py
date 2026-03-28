@@ -106,7 +106,6 @@ def post_rows_to_google_sheet(rows: List[Dict]) -> None:
                 return
         except Exception as e:
             print(f"⚠️ POST failed (attempt {attempt}): {e}")
-
         time.sleep(2)
 
     print("❌ Failed to push data to Google Sheet")
@@ -336,17 +335,28 @@ def get_members(page, city: str) -> List[Dict]:
                 if (href.startsWith('/')) href = 'https://www.bniconnectglobal.com' + href;
                 if (!name || !href) continue;
 
-                const childTexts = Array.from(row.children)
-                    .map(c => (c.innerText || '').replace(/\\s+/g, ' ').trim())
-                    .filter(t => t && t !== name && t !== '+' && t !== 'Connect');
+                const texts = Array.from(row.querySelectorAll('*'))
+                    .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
+                    .filter(Boolean);
 
-                const chapter = childTexts.find(x => /^BNI\\s/i.test(x)) || '';
-                const cityVal = childTexts.find(x => x.toLowerCase() === searchCity.toLowerCase()) || searchCity;
-                const industry = childTexts.find(x => x.includes('>')) || '';
+                const uniqueTexts = [...new Set(texts)];
+
+                let chapter = uniqueTexts.find(x => /^BNI\\s/i.test(x)) || '';
+                let cityVal = uniqueTexts.find(x => x.toLowerCase() === searchCity.toLowerCase()) || searchCity;
+                let industry = uniqueTexts.find(x => x.includes('>')) || '';
 
                 let company = '';
-                for (const x of childTexts) {
-                    if (x !== chapter && x !== cityVal && x !== industry) {
+                for (const x of uniqueTexts) {
+                    if (
+                        x !== name &&
+                        x !== chapter &&
+                        x !== cityVal &&
+                        x !== industry &&
+                        x !== '+' &&
+                        x.toLowerCase() !== 'connect' &&
+                        !/^BNI\\s/i.test(x) &&
+                        !x.includes('>')
+                    ) {
                         company = x;
                         break;
                     }
@@ -416,7 +426,6 @@ def extract_profile(page) -> Dict:
     lines = [norm(x) for x in page.locator("body").inner_text().splitlines() if norm(x)]
     full = " ".join(lines)
 
-    # Email
     try:
         mailto = page.query_selector_all('a[href^="mailto:"]')
         if mailto:
@@ -426,7 +435,6 @@ def extract_profile(page) -> Dict:
     if not det["Email"]:
         det["Email"] = find_email(full)
 
-    # Website
     try:
         link_count = page.locator("a[href]").count()
         for i in range(link_count):
@@ -444,7 +452,6 @@ def extract_profile(page) -> Dict:
     except Exception:
         pass
 
-    # Phone
     phones = []
     for line in lines:
         if re.search(r"\d{2}/\d{2}/\d{4}", line):
@@ -457,7 +464,6 @@ def extract_profile(page) -> Dict:
     if phones:
         det["Phone"] = " / ".join(phones)
 
-    # Address
     addr_candidates = []
     for i, line in enumerate(lines):
         if line == "City" and i > 0:
@@ -485,19 +491,32 @@ def extract_profile(page) -> Dict:
         det["Address"] = addr_candidates[0]
 
     if not det["Address"]:
+        bad_address_phrases = [
+            "i look forward",
+            "happy to write",
+            "construction & building materials",
+            "advertising & marketing",
+            "real estate services",
+            "travel agent",
+            "consulting",
+        ]
+
         for line in lines:
+            low = line.lower()
+            if any(p in low for p in bad_address_phrases):
+                continue
+
             if any(
-                k in line.lower()
-                for k in [
+                k in low for k in [
                     "road", "nagar", "tower", "complex", "floor", "lane",
                     "building", "colony", "plot", "apartment", "ward",
-                    "sector", "phase", "deo"
+                    "sector", "phase", "square", "ring road", "gandhibagh",
+                    "lakadganj", "dhantoli", "manewada", "deo"
                 ]
             ):
                 det["Address"] = line
                 break
 
-    # Professional Classification
     prof_section = False
     for line in lines:
         if line == "Professional Details":
@@ -510,7 +529,6 @@ def extract_profile(page) -> Dict:
                 det["Professional Classification"] = line
                 break
 
-    # Business Description
     prof_section = False
     count = 0
     for line in lines:
@@ -531,7 +549,7 @@ def extract_profile(page) -> Dict:
 
 
 # =========================================================
-# ONE CITY PROCESS
+# COLLECT ALL LINKS FIRST, THEN OPEN PROFILES
 # =========================================================
 def process_city(page, city: str, done_urls: Set[str], all_rows: List[Dict]) -> None:
     open_real_search_page(page)
@@ -541,99 +559,116 @@ def process_city(page, city: str, done_urls: Set[str], all_rows: List[Dict]) -> 
     if total_rows_text:
         print(f"📊 Total rows text: {total_rows_text}")
 
-    no_new = 0
+    print(f"📥 Collecting all member links for {city} before opening profiles...")
+
+    collected_members = []
+    seen_urls_this_city = set()
+    stable_rounds = 0
+    previous_count = 0
 
     while True:
         members = get_members(page, city)
-        new_this_round = 0
-        print(f"👥 Members visible this round for {city}: {len(members)}")
 
         for m in members:
-            url = m["href"]
-            if url in done_urls:
-                continue
-            done_urls.add(url)
+            if m["href"] not in seen_urls_this_city:
+                seen_urls_this_city.add(m["href"])
+                collected_members.append(m)
 
-            print(f"\n➡️ [{len(all_rows)+1}] {m['name']} | {city}")
+        print(f"👥 Total unique visible members collected so far for {city}: {len(collected_members)}")
 
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                page.wait_for_timeout(2500)
-            except Exception as e:
-                print(f"⚠️ Cannot open profile: {e}")
-                open_real_search_page(page)
-                search_city(page, city)
-                continue
+        if len(collected_members) == previous_count:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
 
-            prof = extract_profile(page)
-
-            final = {
-                "Search City": city,
-                "Name": m["name"],
-                "Chapter": m["chapter"],
-                "Company": m["company"],
-                "City": m["city"],
-                "Industry and Classification": m["industry"],
-                "Profile URL": url,
-                "Phone": prof["Phone"],
-                "Email": prof["Email"],
-                "Website": prof["Website"],
-                "Address": prof["Address"],
-                "Professional Classification": prof["Professional Classification"],
-                "Business Description": prof["Business Description"],
-            }
-
-            print(f"   Chapter        : {final['Chapter']}")
-            print(f"   Company        : {final['Company']}")
-            print(f"   Industry       : {final['Industry and Classification']}")
-            print(f"   Phone          : {final['Phone']}")
-            print(f"   Email          : {final['Email']}")
-            print(f"   Website        : {final['Website']}")
-            print(f"   Address        : {final['Address']}")
-            print(f"   Classification : {final['Professional Classification']}")
-
-            append_csv(final)
-            post_rows_to_google_sheet([final])
-            all_rows.append(final)
-            new_this_round += 1
-
-            try:
-                page.go_back(wait_until="domcontentloaded", timeout=15000)
-                page.wait_for_timeout(2500)
-            except Exception:
-                open_real_search_page(page)
-                search_city(page, city)
-
-            if "/web/dashboard/search" not in page.url:
-                open_real_search_page(page)
-                search_city(page, city)
-
-        no_new = 0 if new_this_round else no_new + 1
-        if no_new >= 3:
-            print(f"\n✅ No new members in 3 rounds for {city} — done")
+        if stable_rounds >= 3:
+            print(f"✅ Finished collecting visible members for {city}: {len(collected_members)}")
             break
 
-        print(f"\n⬇️ Scrolling for more members in {city}...")
+        previous_count = len(collected_members)
+
         try:
-            page.mouse.wheel(0, 3000)
-            page.wait_for_timeout(2000)
             page.evaluate(
                 """
                 () => {
-                    document.querySelectorAll('div').forEach(el => {
-                        const s = window.getComputedStyle(el);
-                        if ((s.overflowY === 'auto' || s.overflowY === 'scroll')
-                                && el.scrollHeight > el.clientHeight) {
-                            el.scrollTop += 2000;
-                        }
-                    });
+                    window.scrollTo(0, document.body.scrollHeight);
                 }
                 """
             )
             page.wait_for_timeout(2500)
+
+            page.mouse.wheel(0, 4000)
+            page.wait_for_timeout(2500)
+
+            page.evaluate(
+                """
+                () => {
+                    const els = Array.from(document.querySelectorAll('div'));
+                    for (const el of els) {
+                        const s = window.getComputedStyle(el);
+                        if ((s.overflowY === 'auto' || s.overflowY === 'scroll') &&
+                            el.scrollHeight > el.clientHeight) {
+                            el.scrollTop = el.scrollHeight;
+                        }
+                    }
+                }
+                """
+            )
+            page.wait_for_timeout(3000)
+
         except Exception as e:
-            print(f"⚠️ Scroll issue: {e}")
+            print(f"⚠️ Scroll issue in {city}: {e}")
             break
+
+    print(f"\n🚀 Now opening profiles for {city}...")
+
+    for m in collected_members:
+        url = m["href"]
+        if url in done_urls:
+            continue
+        done_urls.add(url)
+
+        print(f"\n➡️ [{len(all_rows)+1}] {m['name']} | {city}")
+
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            page.wait_for_timeout(2500)
+        except Exception as e:
+            print(f"⚠️ Cannot open profile: {e}")
+            continue
+
+        prof = extract_profile(page)
+
+        final = {
+            "Search City": city,
+            "Name": m["name"],
+            "Chapter": m["chapter"],
+            "Company": m["company"],
+            "City": m["city"],
+            "Industry and Classification": m["industry"],
+            "Profile URL": url,
+            "Phone": prof["Phone"],
+            "Email": prof["Email"],
+            "Website": prof["Website"],
+            "Address": prof["Address"],
+            "Professional Classification": prof["Professional Classification"],
+            "Business Description": prof["Business Description"],
+        }
+
+        print(f"   Chapter        : {final['Chapter']}")
+        print(f"   Company        : {final['Company']}")
+        print(f"   Industry       : {final['Industry and Classification']}")
+        print(f"   Phone          : {final['Phone']}")
+        print(f"   Email          : {final['Email']}")
+        print(f"   Website        : {final['Website']}")
+        print(f"   Address        : {final['Address']}")
+        print(f"   Classification : {final['Professional Classification']}")
+
+        append_csv(final)
+        post_rows_to_google_sheet([final])
+        all_rows.append(final)
+
+    print(f"✅ City completed: {city} | Saved rows: {len(collected_members)}")
 
 
 # =========================================================
