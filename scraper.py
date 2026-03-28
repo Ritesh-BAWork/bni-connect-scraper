@@ -710,9 +710,9 @@ def main():
             print("📤 Google Sheet posting was enabled")
         print("=" * 70)
 
-        input("\nPress ENTER to close browser...")
-        context.close()
-        browser.close()
+        print("\nClosing browser...")
+context.close()
+browser.close()
 
 
 if __name__ == "__main__":
