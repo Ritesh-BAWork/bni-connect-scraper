@@ -2,7 +2,6 @@ import os
 import re
 import csv
 import time
-import json
 import requests
 from typing import List, Dict, Set
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -10,16 +9,24 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 LOGIN_URL = "https://www.bniconnectglobal.com/login/"
 SEARCH_URL = "https://www.bniconnectglobal.com/web/dashboard/search"
 
-CITY = os.getenv("BNI_CITY", "nagpur")
-CITY_TITLE = CITY.strip().title()
-
 BNI_EMAIL = os.getenv("BNI_EMAIL")
 BNI_PASSWORD = os.getenv("BNI_PASSWORD")
 
-GOOGLE_WEBAPP_URL = os.getenv("GOOGLE_WEBAPP_URL", "").strip()
+# Comma-separated city list from env
+CITIES_RAW = os.getenv(
+    "BNI_CITIES",
+    "Nagpur,Bangalore,Pune,Surat,Ahmedabad,Chennai,Hyderabad,Mumbai,"
+    "Sydney-Australia,Melbourne-Australia,Brisbane-Australia,"
+    "Toronto-Canada,Vancouver-Canada,Montreal-Canada,Calgary-Canada,"
+    "Zurich-Switzerland,Geneva-Switzerland,Basel-Switzerland,"
+    "London-UK,Manchester-UK,Birmingham-UK,Milton Keynes-UK"
+)
+CITIES = [c.strip() for c in CITIES_RAW.split(",") if c.strip()]
 
+GOOGLE_WEBAPP_URL = os.getenv("GOOGLE_WEBAPP_URL", "").strip()
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-CSV_FILE = f"bni_{CITY.lower()}_owners.csv"
+
+CSV_FILE = "bni_multi_city_owners.csv"
 
 HEADERS = [
     "Name",
@@ -60,6 +67,8 @@ def extract_website(text: str) -> str:
 def ensure_env():
     if not BNI_EMAIL or not BNI_PASSWORD:
         raise ValueError("BNI_EMAIL or BNI_PASSWORD missing in environment variables.")
+    if not CITIES:
+        raise ValueError("No cities found in BNI_CITIES.")
 
 
 def init_csv():
@@ -145,7 +154,7 @@ def login(page):
     print("✓ Login successful")
 
 
-def search_city(page):
+def search_city(page, city_name: str):
     print("Opening search page...")
     page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=60000)
     sleep(3000)
@@ -155,24 +164,24 @@ def search_city(page):
         'input[type="search"]',
     ], 20000)
 
-    print(f"Searching city: {CITY}")
+    print(f"Searching city: {city_name}")
     page.locator(input_selector).first.click()
-    page.locator(input_selector).first.fill(CITY)
+    page.locator(input_selector).first.fill(city_name)
     page.keyboard.press("Enter")
     sleep(5000)
     print("✓ Search completed")
 
 
-def debug_preview(page):
-    preview = page.locator("body").inner_text()[:3000]
-    print("\n===== PAGE PREVIEW START =====")
+def debug_preview(page, city_name: str):
+    preview = page.locator("body").inner_text()[:4000]
+    print(f"\n===== PAGE PREVIEW START ({city_name}) =====")
     print(preview)
-    print("===== PAGE PREVIEW END =====\n")
+    print(f"===== PAGE PREVIEW END ({city_name}) =====\n")
 
 
-def get_visible_rows(page) -> List[Dict[str, str]]:
+def get_visible_rows(page, city_name: str) -> List[Dict[str, str]]:
     rows = page.evaluate(
-        """(CITY_TITLE) => {
+        """(cityName) => {
             function clean(t) {
               return (t || "").replace(/\\s+/g, " ").trim();
             }
@@ -193,10 +202,10 @@ def get_visible_rows(page) -> List[Dict[str, str]]:
                 const block = clean(node.innerText || "");
                 if (
                   block &&
-                  block.includes(CITY_TITLE) &&
+                  block.toLowerCase().includes(cityName.toLowerCase()) &&
                   /BNI\\s+/i.test(block) &&
                   block.length > 20 &&
-                  block.length < 600 &&
+                  block.length < 700 &&
                   !/Search Members/i.test(block) &&
                   !/Search Results/i.test(block)
                 ) {
@@ -221,7 +230,7 @@ def get_visible_rows(page) -> List[Dict[str, str]]:
               const chapter = lines.find(x => /^BNI\\s+/i.test(x)) || "";
               const chapterIdx = lines.indexOf(chapter);
               let name = chapterIdx > 0 ? lines[chapterIdx - 1] : lines[0];
-              let city = lines.find(x => x.toLowerCase() === CITY_TITLE.toLowerCase()) || CITY_TITLE;
+              let city = lines.find(x => x.toLowerCase() === cityName.toLowerCase()) || cityName;
               let industry = lines.find(x => x.includes(">")) || "";
 
               let company = "";
@@ -248,7 +257,7 @@ def get_visible_rows(page) -> List[Dict[str, str]]:
 
             return out;
         }""",
-        CITY_TITLE,
+        city_name,
     )
 
     cleaned = []
@@ -258,7 +267,7 @@ def get_visible_rows(page) -> List[Dict[str, str]]:
                 "Name": norm(row.get("Name", "")),
                 "Chapter": norm(row.get("Chapter", "")),
                 "Company": norm(row.get("Company", "")),
-                "City": norm(row.get("City", "")) or CITY_TITLE,
+                "City": norm(row.get("City", "")) or city_name,
                 "Industry and Classification": norm(row.get("Industry and Classification", "")),
             })
     return cleaned
@@ -374,13 +383,13 @@ def main():
     ensure_env()
     init_csv()
 
-    print("=" * 50)
-    print("BNI Connect Scraper — Starting")
-    print("City     :", CITY_TITLE)
-    print("Email    :", BNI_EMAIL)
-    print("CSV      :", CSV_FILE)
-    print("Headless :", HEADLESS)
-    print("=" * 50)
+    print("=" * 70)
+    print("BNI Connect Multi-City Scraper — Starting")
+    print("Cities    :", ", ".join(CITIES))
+    print("Email     :", BNI_EMAIL)
+    print("CSV       :", CSV_FILE)
+    print("Headless  :", HEADLESS)
+    print("=" * 70)
 
     all_rows: List[Dict[str, str]] = []
     batch_rows: List[Dict[str, str]] = []
@@ -391,98 +400,104 @@ def main():
         page = browser.new_page()
 
         login(page)
-        search_city(page)
 
-        no_new_rounds = 0
-        round_no = 0
-        did_debug = False
+        for city_name in CITIES:
+            print("\n" + "=" * 70)
+            print("Processing city:", city_name)
+            print("=" * 70)
 
-        while True:
-            round_no += 1
-            visible_rows = get_visible_rows(page)
-            new_count = 0
+            search_city(page, city_name)
 
-            print(f"\nRound {round_no}: visible rows = {len(visible_rows)}")
+            no_new_rounds = 0
+            round_no = 0
+            did_debug = False
 
-            if not visible_rows and not did_debug:
-                debug_preview(page)
-                did_debug = True
+            while True:
+                round_no += 1
+                visible_rows = get_visible_rows(page, city_name)
+                new_count = 0
 
-            for row in visible_rows:
-                key = f"{row['Name']}|{row['Chapter']}|{row['Company']}"
-                if key in done:
-                    continue
+                print(f"City: {city_name} | Round {round_no}: visible rows = {len(visible_rows)}")
 
-                print("Opening profile:", row["Name"])
-                clicked = click_member_name(page, row["Name"])
-                if not clicked:
-                    print("Could not click:", row["Name"])
-                    continue
+                if not visible_rows and not did_debug:
+                    debug_preview(page, city_name)
+                    did_debug = True
 
-                try:
-                    page.wait_for_url("**/web/member**", timeout=15000)
-                except PlaywrightTimeoutError:
-                    print("Profile did not open:", row["Name"])
-                    continue
+                for row in visible_rows:
+                    key = f"{city_name}|{row['Name']}|{row['Chapter']}|{row['Company']}"
+                    if key in done:
+                        continue
 
-                profile = extract_profile(page)
+                    print("Opening profile:", row["Name"], "| City:", city_name)
+                    clicked = click_member_name(page, row["Name"])
+                    if not clicked:
+                        print("Could not click:", row["Name"])
+                        continue
 
-                final_row = {
-                    "Name": row.get("Name", ""),
-                    "Chapter": row.get("Chapter", ""),
-                    "Company": row.get("Company", ""),
-                    "City": row.get("City", CITY_TITLE),
-                    "Industry and Classification": row.get("Industry and Classification", ""),
-                    "Contact": profile.get("Contact", ""),
-                    "Mail": profile.get("Mail", ""),
-                    "Web Page Link": profile.get("Web Page Link", ""),
-                    "Address": profile.get("Address", ""),
-                }
+                    try:
+                        page.wait_for_url("**/web/member**", timeout=15000)
+                    except PlaywrightTimeoutError:
+                        print("Profile did not open:", row["Name"])
+                        continue
 
-                print(final_row)
+                    profile = extract_profile(page)
 
-                all_rows.append(final_row)
-                batch_rows.append(final_row)
-                done.add(key)
-                new_count += 1
-
-                append_csv(final_row)
-
-                if len(batch_rows) >= 10:
-                    post_rows_to_google(batch_rows)
-                    batch_rows = []
-
-                page.go_back(wait_until="domcontentloaded")
-                sleep(2500)
-
-                if "/web/dashboard/search" not in page.url:
-                    search_city(page)
-
-            if new_count == 0:
-                no_new_rounds += 1
-            else:
-                no_new_rounds = 0
-
-            if no_new_rounds >= 3:
-                print("\nNo new members found in 3 rounds. Stopping.")
-                break
-
-            page.evaluate("window.scrollBy(0, 2500)")
-            sleep(1500)
-
-            page.evaluate(
-                """() => {
-                    const els = Array.from(document.querySelectorAll("div"));
-                    for (const el of els) {
-                        const style = window.getComputedStyle(el);
-                        const canScroll =
-                          (style.overflowY === "auto" || style.overflowY === "scroll") &&
-                          el.scrollHeight > el.clientHeight;
-                        if (canScroll) el.scrollTop = el.scrollTop + 1500;
+                    final_row = {
+                        "Name": row.get("Name", ""),
+                        "Chapter": row.get("Chapter", ""),
+                        "Company": row.get("Company", ""),
+                        "City": row.get("City", city_name),
+                        "Industry and Classification": row.get("Industry and Classification", ""),
+                        "Contact": profile.get("Contact", ""),
+                        "Mail": profile.get("Mail", ""),
+                        "Web Page Link": profile.get("Web Page Link", ""),
+                        "Address": profile.get("Address", ""),
                     }
-                }"""
-            )
-            sleep(1500)
+
+                    print(final_row)
+
+                    all_rows.append(final_row)
+                    batch_rows.append(final_row)
+                    done.add(key)
+                    new_count += 1
+
+                    append_csv(final_row)
+
+                    if len(batch_rows) >= 10:
+                        post_rows_to_google(batch_rows)
+                        batch_rows = []
+
+                    page.go_back(wait_until="domcontentloaded")
+                    sleep(2500)
+
+                    if "/web/dashboard/search" not in page.url:
+                        search_city(page, city_name)
+
+                if new_count == 0:
+                    no_new_rounds += 1
+                else:
+                    no_new_rounds = 0
+
+                if no_new_rounds >= 3:
+                    print(f"No new members found for {city_name}. Moving to next city.")
+                    break
+
+                page.evaluate("window.scrollBy(0, 2500)")
+                sleep(1500)
+
+                page.evaluate(
+                    """() => {
+                        const els = Array.from(document.querySelectorAll("div"));
+                        for (const el of els) {
+                            const style = window.getComputedStyle(el);
+                            const canScroll =
+                              (style.overflowY === "auto" || style.overflowY === "scroll") &&
+                              el.scrollHeight > el.clientHeight;
+                            if (canScroll) el.scrollTop = el.scrollTop + 1500;
+                        }
+                    }"""
+                )
+                sleep(1500)
 
         if batch_rows:
             post_rows_to_google(batch_rows)
