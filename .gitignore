@@ -1,6 +1,6 @@
 __pycache__/
-*.csv
+*.pyc
 .env
-node_modules/
-playwright-report/
-test-results/
+debug_*.html
+bni_members.csv
+progress_state.json
