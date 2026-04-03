@@ -1,4 +1,5 @@
 import csv
+import json
 import os
 import re
 import time
@@ -24,6 +25,8 @@ SLOW_MO = int(os.getenv("SLOW_MO", "250"))
 CSV_FILE = os.getenv("CSV_FILE", "bni_members.csv")
 GOOGLE_WEBAPP_URL = os.getenv("GOOGLE_WEBAPP_URL", "").strip()
 DEBUG_HTML = os.getenv("DEBUG_HTML", "true").lower() == "true"
+
+PROGRESS_FILE = os.getenv("PROGRESS_FILE", "progress_state.json")
 
 
 # =========================================================
@@ -77,6 +80,9 @@ def save_html(page, filename: str) -> None:
 
 
 def init_csv() -> None:
+    if os.path.exists(CSV_FILE):
+        print(f"📄 CSV exists: {CSV_FILE}")
+        return
     with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow(HEADERS)
     print(f"📄 CSV ready: {CSV_FILE}")
@@ -85,6 +91,24 @@ def init_csv() -> None:
 def append_csv(row: Dict) -> None:
     with open(CSV_FILE, "a", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow([row.get(h, "") for h in HEADERS])
+
+
+def load_done_urls_from_csv() -> Set[str]:
+    done = set()
+    if not os.path.exists(CSV_FILE):
+        return done
+
+    try:
+        with open(CSV_FILE, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                url = norm(row.get("Profile URL", ""))
+                if url:
+                    done.add(url)
+    except Exception as e:
+        print(f"⚠️ Could not read existing CSV for resume: {e}")
+
+    return done
 
 
 def post_rows_to_google_sheet(rows: List[Dict]) -> None:
@@ -153,6 +177,65 @@ def fill_first_visible(page, selectors: List[str], value: str, press_enter: bool
         except Exception:
             pass
     return False
+
+
+# =========================================================
+# PROGRESS / RESUME
+# =========================================================
+def default_progress() -> Dict:
+    return {
+        "current_city": "",
+        "completed_cities": [],
+        "done_urls": [],
+        "last_saved_at": "",
+    }
+
+
+def load_progress() -> Dict:
+    if not os.path.exists(PROGRESS_FILE):
+        return default_progress()
+
+    try:
+        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        base = default_progress()
+        base.update(data)
+        return base
+    except Exception as e:
+        print(f"⚠️ Could not read progress file, starting fresh: {e}")
+        return default_progress()
+
+
+def save_progress(progress: Dict) -> None:
+    try:
+        progress["last_saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+            json.dump(progress, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Could not save progress file: {e}")
+
+
+def mark_city_started(progress: Dict, city: str) -> None:
+    progress["current_city"] = city
+    save_progress(progress)
+
+
+def mark_city_completed(progress: Dict, city: str) -> None:
+    if city not in progress["completed_cities"]:
+        progress["completed_cities"].append(city)
+    progress["current_city"] = ""
+    save_progress(progress)
+
+
+def mark_url_done(progress: Dict, url: str) -> None:
+    if url and url not in progress["done_urls"]:
+        progress["done_urls"].append(url)
+        save_progress(progress)
+
+
+def get_resume_cities(progress: Dict, all_cities: List[str]) -> List[str]:
+    completed = set(progress.get("completed_cities", []))
+    return [c for c in all_cities if c not in completed]
 
 
 # =========================================================
@@ -549,9 +632,11 @@ def extract_profile(page) -> Dict:
 
 
 # =========================================================
-# COLLECT ALL LINKS FIRST, THEN OPEN PROFILES
+# COLLECT LINKS THEN OPEN PROFILES
 # =========================================================
-def process_city(page, city: str, done_urls: Set[str], all_rows: List[Dict]) -> None:
+def process_city(page, city: str, done_urls: Set[str], all_rows: List[Dict], progress: Dict) -> None:
+    mark_city_started(progress, city)
+
     open_real_search_page(page)
     search_city(page, city)
 
@@ -627,7 +712,6 @@ def process_city(page, city: str, done_urls: Set[str], all_rows: List[Dict]) -> 
         url = m["href"]
         if url in done_urls:
             continue
-        done_urls.add(url)
 
         print(f"\n➡️ [{len(all_rows)+1}] {m['name']} | {city}")
 
@@ -669,6 +753,10 @@ def process_city(page, city: str, done_urls: Set[str], all_rows: List[Dict]) -> 
         post_rows_to_google_sheet([final])
         all_rows.append(final)
 
+        done_urls.add(url)
+        mark_url_done(progress, url)
+
+    mark_city_completed(progress, city)
     print(f"✅ City completed: {city} | Saved rows: {len(collected_members)}")
 
 
@@ -680,16 +768,32 @@ def main():
         raise Exception("Set BNI_EMAIL and BNI_PASSWORD first")
 
     print("=" * 70)
-    print("BNI Connect Scraper — Final Stable Hybrid")
+    print("BNI Connect Scraper — Resume Enabled")
     print(f"Cities    : {', '.join(BNI_CITIES)}")
     print(f"CSV       : {CSV_FILE}")
     print(f"Headless  : {HEADLESS}")
+    print(f"Progress  : {PROGRESS_FILE}")
     print("=" * 70)
 
     init_csv()
 
+    progress = load_progress()
+
+    done_urls_from_csv = load_done_urls_from_csv()
+    done_urls_from_progress = set(progress.get("done_urls", []))
+    done_urls: Set[str] = set(done_urls_from_csv) | set(done_urls_from_progress)
+
     all_rows: List[Dict] = []
-    done_urls: Set[str] = set()
+
+    remaining_cities = get_resume_cities(progress, BNI_CITIES)
+
+    print(f"✅ Already completed cities: {progress.get('completed_cities', [])}")
+    print(f"▶ Remaining cities: {remaining_cities}")
+    print(f"🔁 Already saved profile URLs: {len(done_urls)}")
+
+    if not remaining_cities:
+        print("🎉 All configured cities already completed.")
+        return
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO)
@@ -698,14 +802,16 @@ def main():
 
         login(page)
 
-        for city in BNI_CITIES:
+        for city in remaining_cities:
             try:
-                process_city(page, city, done_urls, all_rows)
+                process_city(page, city, done_urls, all_rows, progress)
             except Exception as e:
                 print(f"❌ City failed: {city} | {e}")
+                save_progress(progress)
+                break
 
         print("\n" + "=" * 70)
-        print(f"🎉 DONE! Total members saved: {len(all_rows)}")
+        print(f"🎉 DONE! New rows saved in this run: {len(all_rows)}")
         print(f"📄 CSV: {CSV_FILE}")
         if GOOGLE_WEBAPP_URL and GOOGLE_WEBAPP_URL != "YOUR_URL":
             print("📤 Google Sheet posting was enabled")
