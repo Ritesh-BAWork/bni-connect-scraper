@@ -3,7 +3,7 @@ import json
 import os
 import re
 import time
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -20,13 +20,17 @@ LOGIN_URL = "https://www.bniconnectglobal.com/login/"
 DASHBOARD_URL = "https://www.bniconnectglobal.com/web/dashboard"
 SEARCH_URL = "https://www.bniconnectglobal.com/web/dashboard/search"
 
-HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
-SLOW_MO = int(os.getenv("SLOW_MO", "250"))
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+SLOW_MO = int(os.getenv("SLOW_MO", "0"))
 CSV_FILE = os.getenv("CSV_FILE", "bni_members.csv")
 GOOGLE_WEBAPP_URL = os.getenv("GOOGLE_WEBAPP_URL", "").strip()
-DEBUG_HTML = os.getenv("DEBUG_HTML", "true").lower() == "true"
-
+DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
 PROGRESS_FILE = os.getenv("PROGRESS_FILE", "progress_state.json")
+
+# Stop before GitHub timeout so artifacts can upload
+MAX_RUN_MINUTES = int(os.getenv("MAX_RUN_MINUTES", "330"))   # 5.5 hours
+SAFE_EXIT_BUFFER_SECONDS = int(os.getenv("SAFE_EXIT_BUFFER_SECONDS", "300"))  # 5 min
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 
 
 # =========================================================
@@ -109,30 +113,6 @@ def load_done_urls_from_csv() -> Set[str]:
         print(f"⚠️ Could not read existing CSV for resume: {e}")
 
     return done
-
-
-def post_rows_to_google_sheet(rows: List[Dict]) -> None:
-    if not GOOGLE_WEBAPP_URL or GOOGLE_WEBAPP_URL == "YOUR_URL":
-        print("ℹ️ GOOGLE_WEBAPP_URL not set. Skipping Google Sheet upload.")
-        return
-
-    if not rows:
-        return
-
-    payload = {"rows": rows}
-
-    for attempt in range(1, 4):
-        try:
-            r = requests.post(GOOGLE_WEBAPP_URL, json=payload, timeout=60)
-            print(f"📤 Apps Script POST: {r.status_code}")
-            print(f"📤 Response: {r.text[:200]}")
-            if r.ok:
-                return
-        except Exception as e:
-            print(f"⚠️ POST failed (attempt {attempt}): {e}")
-        time.sleep(2)
-
-    print("❌ Failed to push data to Google Sheet")
 
 
 def click_first_visible(page, selectors: List[str], timeout_ms: int = 3000) -> bool:
@@ -236,6 +216,44 @@ def mark_url_done(progress: Dict, url: str) -> None:
 def get_resume_cities(progress: Dict, all_cities: List[str]) -> List[str]:
     completed = set(progress.get("completed_cities", []))
     return [c for c in all_cities if c not in completed]
+
+
+# =========================================================
+# GOOGLE SHEET BATCH UPLOAD
+# =========================================================
+def flush_google_batch(batch_rows: List[Dict]) -> None:
+    if not batch_rows:
+        return
+
+    if not GOOGLE_WEBAPP_URL or GOOGLE_WEBAPP_URL == "YOUR_URL":
+        print("ℹ️ GOOGLE_WEBAPP_URL not set. Skipping Google Sheet upload.")
+        return
+
+    payload = {"rows": batch_rows}
+
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(GOOGLE_WEBAPP_URL, json=payload, timeout=120)
+            print(f"📤 Apps Script POST: {r.status_code} | batch={len(batch_rows)}")
+            print(f"📤 Response: {r.text[:200]}")
+            if r.ok:
+                return
+        except Exception as e:
+            print(f"⚠️ Batch POST failed (attempt {attempt}): {e}")
+        time.sleep(2)
+
+    print("❌ Failed to push batch to Google Sheet")
+
+
+# =========================================================
+# RUNTIME CONTROL
+# =========================================================
+def make_deadline() -> float:
+    return time.time() + (MAX_RUN_MINUTES * 60)
+
+
+def should_stop(deadline: float) -> bool:
+    return time.time() >= (deadline - SAFE_EXIT_BUFFER_SECONDS)
 
 
 # =========================================================
@@ -632,61 +650,150 @@ def extract_profile(page) -> Dict:
 
 
 # =========================================================
-# COLLECT LINKS THEN OPEN PROFILES
+# SCRAPE ONE PROFILE
 # =========================================================
-def process_city(page, city: str, done_urls: Set[str], all_rows: List[Dict], progress: Dict) -> None:
+def scrape_one_profile(profile_page, member: Dict, city: str) -> Dict | None:
+    url = member["href"]
+
+    try:
+        profile_page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        profile_page.wait_for_timeout(2500)
+    except Exception as e:
+        print(f"⚠️ Cannot open profile: {e}")
+        return None
+
+    prof = extract_profile(profile_page)
+
+    final = {
+        "Search City": city,
+        "Name": member["name"],
+        "Chapter": member["chapter"],
+        "Company": member["company"],
+        "City": member["city"],
+        "Industry and Classification": member["industry"],
+        "Profile URL": url,
+        "Phone": prof["Phone"],
+        "Email": prof["Email"],
+        "Website": prof["Website"],
+        "Address": prof["Address"],
+        "Professional Classification": prof["Professional Classification"],
+        "Business Description": prof["Business Description"],
+    }
+
+    print(f"\n➡️ {final['Name']} | {city}")
+    print(f"   Chapter        : {final['Chapter']}")
+    print(f"   Company        : {final['Company']}")
+    print(f"   Industry       : {final['Industry and Classification']}")
+    print(f"   Phone          : {final['Phone']}")
+    print(f"   Email          : {final['Email']}")
+    print(f"   Website        : {final['Website']}")
+    print(f"   Address        : {final['Address']}")
+    print(f"   Classification : {final['Professional Classification']}")
+
+    return final
+
+
+# =========================================================
+# PROCESS CITY
+# =========================================================
+def process_city(
+    search_page,
+    profile_page,
+    city: str,
+    done_urls: Set[str],
+    all_rows: List[Dict],
+    progress: Dict,
+    google_batch: List[Dict],
+    deadline: float,
+) -> Tuple[bool, List[Dict]]:
     mark_city_started(progress, city)
 
-    open_real_search_page(page)
-    search_city(page, city)
+    open_real_search_page(search_page)
+    search_city(search_page, city)
 
-    total_rows_text = read_total_rows_text(page)
+    total_rows_text = read_total_rows_text(search_page)
     if total_rows_text:
         print(f"📊 Total rows text: {total_rows_text}")
 
-    print(f"📥 Collecting all member links for {city} before opening profiles...")
+    print(f"📥 Scanning and scraping members for {city}...")
 
-    collected_members: List[Dict] = []
     seen_urls_this_city: Set[str] = set()
     stable_rounds = 0
-    previous_count = 0
-    max_scroll_rounds = 200
+    previous_visible_count = 0
+    max_scroll_rounds = 500
 
     for _ in range(max_scroll_rounds):
-        members = get_members(page, city)
+        if should_stop(deadline):
+            print(f"⏳ Stopping safely before timeout while in city: {city}")
+            save_progress(progress)
+            flush_google_batch(google_batch)
+            google_batch.clear()
+            return False, google_batch
 
-        for m in members:
-            if m["href"] not in seen_urls_this_city:
-                seen_urls_this_city.add(m["href"])
-                collected_members.append(m)
+        members = get_members(search_page, city)
 
-        print(f"👥 Total unique visible members collected so far for {city}: {len(collected_members)}")
+        newly_seen_visible = 0
+        for member in members:
+            url = member["href"]
+            if url not in seen_urls_this_city:
+                seen_urls_this_city.add(url)
+                newly_seen_visible += 1
 
-        if len(collected_members) == previous_count:
+            if url in done_urls:
+                continue
+
+            final = scrape_one_profile(profile_page, member, city)
+            if not final:
+                continue
+
+            append_csv(final)
+            google_batch.append(final)
+            all_rows.append(final)
+
+            done_urls.add(url)
+            mark_url_done(progress, url)
+
+            if len(google_batch) >= BATCH_SIZE:
+                flush_google_batch(google_batch)
+                google_batch.clear()
+
+            if should_stop(deadline):
+                print(f"⏳ Stopping safely before timeout after scraping member in city: {city}")
+                save_progress(progress)
+                flush_google_batch(google_batch)
+                google_batch.clear()
+                return False, google_batch
+
+        print(f"👥 Total visible unique members seen so far for {city}: {len(seen_urls_this_city)}")
+
+        if len(seen_urls_this_city) == previous_visible_count:
             stable_rounds += 1
         else:
             stable_rounds = 0
 
         if stable_rounds >= 3:
-            print(f"✅ Finished collecting visible members for {city}: {len(collected_members)}")
-            break
+            flush_google_batch(google_batch)
+            google_batch.clear()
+            mark_city_completed(progress, city)
+            print(f"✅ City completed: {city} | Visible unique members seen: {len(seen_urls_this_city)}")
+            return True, google_batch
 
-        previous_count = len(collected_members)
+        previous_visible_count = len(seen_urls_this_city)
 
         try:
-            page.evaluate(
+            search_page.evaluate(
                 """
                 () => {
                     window.scrollTo(0, document.body.scrollHeight);
                 }
                 """
             )
-            page.wait_for_timeout(2500)
+            search_page.wait_for_timeout(2000)
 
-            page.mouse.wheel(0, 4000)
-            page.wait_for_timeout(2500)
+            search_page.mouse.wheel(0, 4000)
+            search_page.wait_for_timeout(2000)
 
-            page.evaluate(
+            search_page.evaluate(
                 """
                 () => {
                     const els = Array.from(document.querySelectorAll('div'));
@@ -700,64 +807,16 @@ def process_city(page, city: str, done_urls: Set[str], all_rows: List[Dict], pro
                 }
                 """
             )
-            page.wait_for_timeout(3000)
-
+            search_page.wait_for_timeout(2500)
         except Exception as e:
             print(f"⚠️ Scroll issue in {city}: {e}")
             break
 
-    print(f"\n🚀 Now opening profiles for {city}...")
-
-    for m in collected_members:
-        url = m["href"]
-        if url in done_urls:
-            continue
-
-        print(f"\n➡️ [{len(all_rows)+1}] {m['name']} | {city}")
-
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=25000)
-            page.wait_for_timeout(2500)
-        except Exception as e:
-            print(f"⚠️ Cannot open profile: {e}")
-            continue
-
-        prof = extract_profile(page)
-
-        final = {
-            "Search City": city,
-            "Name": m["name"],
-            "Chapter": m["chapter"],
-            "Company": m["company"],
-            "City": m["city"],
-            "Industry and Classification": m["industry"],
-            "Profile URL": url,
-            "Phone": prof["Phone"],
-            "Email": prof["Email"],
-            "Website": prof["Website"],
-            "Address": prof["Address"],
-            "Professional Classification": prof["Professional Classification"],
-            "Business Description": prof["Business Description"],
-        }
-
-        print(f"   Chapter        : {final['Chapter']}")
-        print(f"   Company        : {final['Company']}")
-        print(f"   Industry       : {final['Industry and Classification']}")
-        print(f"   Phone          : {final['Phone']}")
-        print(f"   Email          : {final['Email']}")
-        print(f"   Website        : {final['Website']}")
-        print(f"   Address        : {final['Address']}")
-        print(f"   Classification : {final['Professional Classification']}")
-
-        append_csv(final)
-        post_rows_to_google_sheet([final])
-        all_rows.append(final)
-
-        done_urls.add(url)
-        mark_url_done(progress, url)
-
+    flush_google_batch(google_batch)
+    google_batch.clear()
     mark_city_completed(progress, city)
-    print(f"✅ City completed: {city} | Saved rows: {len(collected_members)}")
+    print(f"✅ City completed by scroll limit: {city}")
+    return True, google_batch
 
 
 # =========================================================
@@ -768,11 +827,13 @@ def main():
         raise Exception("Set BNI_EMAIL and BNI_PASSWORD first")
 
     print("=" * 70)
-    print("BNI Connect Scraper — Resume Enabled")
+    print("BNI Connect Scraper — Timeout Safe + Resume Enabled")
     print(f"Cities    : {', '.join(BNI_CITIES)}")
     print(f"CSV       : {CSV_FILE}")
     print(f"Headless  : {HEADLESS}")
     print(f"Progress  : {PROGRESS_FILE}")
+    print(f"Max run   : {MAX_RUN_MINUTES} minutes")
+    print(f"Batch size: {BATCH_SIZE}")
     print("=" * 70)
 
     init_csv()
@@ -784,6 +845,7 @@ def main():
     done_urls: Set[str] = set(done_urls_from_csv) | set(done_urls_from_progress)
 
     all_rows: List[Dict] = []
+    google_batch: List[Dict] = []
 
     remaining_cities = get_resume_cities(progress, BNI_CITIES)
 
@@ -795,20 +857,42 @@ def main():
         print("🎉 All configured cities already completed.")
         return
 
+    deadline = make_deadline()
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO)
         context = browser.new_context()
-        page = context.new_page()
+        search_page = context.new_page()
+        profile_page = context.new_page()
 
-        login(page)
+        login(search_page)
 
         for city in remaining_cities:
             try:
-                process_city(page, city, done_urls, all_rows, progress)
+                completed, google_batch = process_city(
+                    search_page=search_page,
+                    profile_page=profile_page,
+                    city=city,
+                    done_urls=done_urls,
+                    all_rows=all_rows,
+                    progress=progress,
+                    google_batch=google_batch,
+                    deadline=deadline,
+                )
+
+                if not completed:
+                    print(f"⏸ Run stopped safely. Next run will resume from city: {city}")
+                    break
+
             except Exception as e:
                 print(f"❌ City failed: {city} | {e}")
                 save_progress(progress)
+                flush_google_batch(google_batch)
+                google_batch.clear()
                 break
+
+        flush_google_batch(google_batch)
+        google_batch.clear()
 
         print("\n" + "=" * 70)
         print(f"🎉 DONE! New rows saved in this run: {len(all_rows)}")
@@ -818,6 +902,14 @@ def main():
         print("=" * 70)
 
         print("\nClosing browser...")
+        try:
+            profile_page.close()
+        except Exception:
+            pass
+        try:
+            search_page.close()
+        except Exception:
+            pass
         context.close()
         browser.close()
 
