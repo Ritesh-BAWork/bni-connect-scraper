@@ -52,7 +52,7 @@ jobs:
           current_run_id = int(os.environ["CURRENT_RUN_ID"])
           branch = os.environ["BRANCH_NAME"]
 
-          url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_file}/runs?branch={branch}&per_page=30"
+          url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_file}/runs?branch={branch}&per_page=50"
           req = urllib.request.Request(
               url,
               headers={
@@ -117,6 +117,9 @@ jobs:
           DEBUG_HTML: "false"
           CSV_FILE: "bni_members.csv"
           PROGRESS_FILE: "progress_state.json"
+          MAX_RUN_MINUTES: "330"
+          SAFE_EXIT_BUFFER_SECONDS: "300"
+          BATCH_SIZE: "50"
         run: |
           python scraper.py
 
