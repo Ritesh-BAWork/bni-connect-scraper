@@ -27,11 +27,8 @@ GOOGLE_WEBAPP_URL = os.getenv("GOOGLE_WEBAPP_URL", "").strip()
 DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
 PROGRESS_FILE = os.getenv("PROGRESS_FILE", "progress_state.json")
 
-# Safe stop before GitHub hard timeout
 MAX_RUN_MINUTES = int(os.getenv("MAX_RUN_MINUTES", "330"))
 SAFE_EXIT_BUFFER_SECONDS = int(os.getenv("SAFE_EXIT_BUFFER_SECONDS", "300"))
-
-# Batch post to Google Sheet
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 
 
@@ -74,6 +71,11 @@ def is_phone(t: str) -> bool:
     return 8 <= len(digits) <= 15
 
 
+def clean_phone(t: str) -> str:
+    digits = re.sub(r"\D", "", t or "")
+    return digits if 8 <= len(digits) <= 15 else ""
+
+
 def save_html(page, filename: str) -> None:
     if not DEBUG_HTML:
         return
@@ -100,10 +102,8 @@ def init_csv() -> None:
     if os.path.exists(CSV_FILE):
         print(f"📄 CSV exists: {CSV_FILE}")
         return
-
     with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow(HEADERS)
-
     print(f"📄 CSV ready: {CSV_FILE}")
 
 
@@ -116,7 +116,6 @@ def load_done_urls_from_csv() -> Set[str]:
     done = set()
     if not os.path.exists(CSV_FILE):
         return done
-
     try:
         with open(CSV_FILE, "r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
@@ -126,12 +125,11 @@ def load_done_urls_from_csv() -> Set[str]:
                     done.add(url)
     except Exception as e:
         print(f"⚠️ Could not read existing CSV for resume: {e}")
-
     return done
 
 
 # =========================================================
-# GOOGLE SHEET BATCH POST
+# GOOGLE SHEET
 # =========================================================
 def flush_google_batch(batch_rows: List[Dict]) -> None:
     if not batch_rows:
@@ -174,7 +172,6 @@ def default_progress() -> Dict:
 def load_progress() -> Dict:
     if not os.path.exists(PROGRESS_FILE):
         return default_progress()
-
     try:
         with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -203,7 +200,6 @@ def mark_url_done(progress: Dict, url: str) -> None:
 def mark_city_completed(progress: Dict, city: str) -> None:
     if city not in progress["completed_cities"]:
         progress["completed_cities"].append(city)
-
     progress["current_city"] = ""
     progress["city_queue"] = []
     progress["city_index"] = 0
@@ -399,7 +395,7 @@ def search_city(page, city: str) -> None:
 
 
 # =========================================================
-# RESULT READING
+# MEMBER LIST
 # =========================================================
 def get_members(page, city: str) -> List[Dict]:
     results = page.evaluate(
@@ -475,7 +471,6 @@ def get_members(page, city: str) -> List[Dict]:
         href = norm(r.get("href", ""))
         if not name or not href:
             continue
-
         cleaned.append({
             "name": name,
             "href": href,
@@ -484,7 +479,6 @@ def get_members(page, city: str) -> List[Dict]:
             "city": norm(r.get("city", "")) or city,
             "industry": norm(r.get("industry", "")),
         })
-
     return cleaned
 
 
@@ -505,7 +499,6 @@ def collect_all_links_for_city(search_page, city: str, deadline: float) -> List[
             break
 
         members = get_members(search_page, city)
-
         for m in members:
             if m["href"] not in seen_urls:
                 seen_urls.add(m["href"])
@@ -527,9 +520,7 @@ def collect_all_links_for_city(search_page, city: str, deadline: float) -> List[
         try:
             search_page.evaluate(
                 """
-                () => {
-                    window.scrollTo(0, document.body.scrollHeight);
-                }
+                () => { window.scrollTo(0, document.body.scrollHeight); }
                 """
             )
             search_page.wait_for_timeout(2000)
@@ -560,8 +551,67 @@ def collect_all_links_for_city(search_page, city: str, deadline: float) -> List[
 
 
 # =========================================================
-# PROFILE EXTRACTION
+# PROFILE EXTRACTION - IMPROVED
 # =========================================================
+def get_lines(page) -> List[str]:
+    try:
+        text = page.locator("body").inner_text()
+    except Exception:
+        return []
+    return [norm(x) for x in text.splitlines() if norm(x)]
+
+
+def find_value_after_labels(lines: List[str], labels: List[str]) -> str:
+    label_set = {x.lower() for x in labels}
+    for i, line in enumerate(lines):
+        low = line.lower().strip(": ")
+        if low in label_set:
+            if i + 1 < len(lines):
+                nxt = norm(lines[i + 1])
+                if nxt and nxt.lower() not in label_set:
+                    return nxt
+        for lab in label_set:
+            if line.lower().startswith(lab + ":"):
+                return norm(line.split(":", 1)[1])
+    return ""
+
+
+def find_address_from_lines(lines: List[str]) -> str:
+    bad_address_phrases = [
+        "i look forward",
+        "happy to write",
+        "construction & building materials",
+        "advertising & marketing",
+        "real estate services",
+        "travel agent",
+        "consulting",
+    ]
+
+    address_keywords = [
+        "road", "rd", "street", "st", "nagar", "tower", "complex",
+        "floor", "lane", "building", "colony", "plot", "apartment",
+        "ward", "sector", "phase", "square", "ring road", "near",
+        "opp", "opposite", "layout", "flat no", "office no", "shop no"
+    ]
+
+    # Try labeled address first
+    addr = find_value_after_labels(lines, ["Address", "Office Address", "Business Address"])
+    if addr:
+        return addr
+
+    # Then heuristic
+    for line in lines:
+        low = line.lower()
+        if any(p in low for p in bad_address_phrases):
+            continue
+        if "@" in low or low.startswith("http"):
+            continue
+        if any(k in low for k in address_keywords):
+            return line
+
+    return ""
+
+
 def extract_profile(page) -> Dict:
     det = {
         "Phone": "",
@@ -580,18 +630,54 @@ def extract_profile(page) -> Dict:
 
     save_html(page, "debug_current_profile.html")
 
-    lines = [norm(x) for x in page.locator("body").inner_text().splitlines() if norm(x)]
+    lines = get_lines(page)
     full = " ".join(lines)
 
+    # EMAIL
     try:
-        mailto = page.query_selector_all('a[href^="mailto:"]')
-        if mailto:
-            det["Email"] = norm((mailto[0].get_attribute("href") or "").replace("mailto:", ""))
+        mailtos = page.query_selector_all('a[href^="mailto:"]')
+        for m in mailtos:
+            href = (m.get_attribute("href") or "").replace("mailto:", "").strip()
+            if href:
+                det["Email"] = href
+                break
     except Exception:
         pass
     if not det["Email"]:
+        det["Email"] = find_value_after_labels(lines, ["Email", "E-mail", "Mail"])
+    if not det["Email"]:
         det["Email"] = find_email(full)
 
+    # PHONE
+    phone_candidates = []
+    try:
+        tels = page.query_selector_all('a[href^="tel:"]')
+        for t in tels:
+            href = (t.get_attribute("href") or "").replace("tel:", "").strip()
+            cp = clean_phone(href)
+            if cp and cp not in phone_candidates:
+                phone_candidates.append(cp)
+    except Exception:
+        pass
+
+    if not phone_candidates:
+        direct_phone = find_value_after_labels(lines, ["Phone", "Mobile", "Contact", "Telephone"])
+        cp = clean_phone(direct_phone)
+        if cp:
+            phone_candidates.append(cp)
+
+    if not phone_candidates:
+        for line in lines:
+            cp = clean_phone(line)
+            if cp and cp not in phone_candidates:
+                phone_candidates.append(cp)
+            if len(phone_candidates) >= 2:
+                break
+
+    if phone_candidates:
+        det["Phone"] = " / ".join(phone_candidates[:2])
+
+    # WEBSITE
     try:
         link_count = page.locator("a[href]").count()
         for i in range(link_count):
@@ -608,99 +694,58 @@ def extract_profile(page) -> Dict:
                 break
     except Exception:
         pass
+    if not det["Website"]:
+        det["Website"] = find_value_after_labels(lines, ["Website", "Web", "URL"])
 
-    phones = []
-    for line in lines:
-        if re.search(r"\d{2}/\d{2}/\d{4}", line):
-            continue
-        cleaned = re.sub(r"[\s\-\(\)\+]", "", line)
-        if is_phone(cleaned) and cleaned not in phones:
-            phones.append(cleaned)
-        if len(phones) == 2:
-            break
-    if phones:
-        det["Phone"] = " / ".join(phones)
+    # ADDRESS
+    det["Address"] = find_address_from_lines(lines)
 
-    addr_candidates = []
-    for i, line in enumerate(lines):
-        if line == "City" and i > 0:
-            for j in range(i - 1, max(i - 6, 0), -1):
-                candidate = lines[j]
-                if (
-                    len(candidate) > 5
-                    and "@" not in candidate
-                    and not candidate.startswith("http")
-                    and not is_phone(re.sub(r"[\s\-]", "", candidate))
-                    and candidate not in {
-                        "Personal Details",
-                        "Professional Details",
-                        "My Bio",
-                        "Profile",
-                        "MSP",
-                        "Training History",
-                    }
-                    and not re.search(r"\d{2}/\d{2}/\d{4}", candidate)
-                ):
-                    addr_candidates.append(candidate)
-                    break
+    # CLASSIFICATION
+    det["Professional Classification"] = find_value_after_labels(
+        lines,
+        [
+            "Professional Classification",
+            "Classification",
+            "Category",
+            "Profession",
+            "Professional Details",
+        ],
+    )
 
-    if addr_candidates:
-        det["Address"] = addr_candidates[0]
-
-    if not det["Address"]:
-        bad_address_phrases = [
-            "i look forward",
-            "happy to write",
-            "construction & building materials",
-            "advertising & marketing",
-            "real estate services",
-            "travel agent",
-            "consulting",
-        ]
-
+    # Better fallback for classification:
+    if not det["Professional Classification"]:
         for line in lines:
-            low = line.lower()
-            if any(p in low for p in bad_address_phrases):
-                continue
-
-            if any(
-                k in low for k in [
-                    "road", "nagar", "tower", "complex", "floor", "lane",
-                    "building", "colony", "plot", "apartment", "ward",
-                    "sector", "phase", "square", "ring road", "gandhibagh",
-                    "lakadganj", "dhantoli", "manewada", "deo"
-                ]
-            ):
-                det["Address"] = line
-                break
-
-    prof_section = False
-    for line in lines:
-        if line == "Professional Details":
-            prof_section = True
-            continue
-        if prof_section:
-            if line in {"My Bio", "Training History", "‹", "›", "Profile"}:
-                break
-            if len(line) > 3 and not re.search(r"\d{2}/\d{2}/\d{4}", line):
+            if " > " in line:
                 det["Professional Classification"] = line
                 break
 
-    prof_section = False
-    count = 0
-    for line in lines:
-        if line == "Professional Details":
-            prof_section = True
-            count = 0
-            continue
-        if prof_section:
-            if line in {"My Bio", "Training History", "‹", "›", "Profile"}:
-                break
-            if len(line) > 10 and not re.search(r"\d{2}/\d{2}/\d{4}", line):
-                count += 1
-                if count == 2:
-                    det["Business Description"] = line
+    # BUSINESS DESCRIPTION
+    det["Business Description"] = find_value_after_labels(
+        lines,
+        [
+            "Business Description",
+            "About Business",
+            "Description",
+            "My Bio",
+            "Bio",
+        ],
+    )
+
+    # More reliable section fallback
+    if not det["Business Description"]:
+        in_prof = False
+        collected = []
+        stop_markers = {"Training History", "‹", "›", "Profile"}
+        for line in lines:
+            if line in {"My Bio", "Bio"}:
+                in_prof = True
+                continue
+            if in_prof:
+                if line in stop_markers:
                     break
+                collected.append(line)
+        if collected:
+            det["Business Description"] = " ".join(collected[:3])
 
     return det
 
@@ -762,13 +807,6 @@ def process_city(
     progress["current_city"] = city
     save_progress(progress)
 
-    # Build queue only if current city queue is empty or for another city
-    if progress.get("current_city") != city or not progress.get("city_queue"):
-        progress["current_city"] = city
-        progress["city_queue"] = []
-        progress["city_index"] = 0
-        save_progress(progress)
-
     if not progress.get("city_queue"):
         queue = collect_all_links_for_city(search_page, city, deadline)
         progress["city_queue"] = queue
@@ -829,7 +867,7 @@ def main():
         raise Exception("Set BNI_EMAIL and BNI_PASSWORD first")
 
     print("=" * 70)
-    print("BNI Connect Scraper — Full City Queue Resume")
+    print("BNI Connect Scraper — Queue Resume + Better Extraction")
     print(f"Cities    : {', '.join(BNI_CITIES)}")
     print(f"CSV       : {CSV_FILE}")
     print(f"Headless  : {HEADLESS}")
@@ -841,7 +879,6 @@ def main():
     init_csv()
 
     progress = load_progress()
-
     done_urls_from_csv = load_done_urls_from_csv()
     done_urls_from_progress = set(progress.get("done_urls", []))
     done_urls: Set[str] = set(done_urls_from_csv) | set(done_urls_from_progress)
@@ -869,7 +906,6 @@ def main():
 
         login(search_page)
 
-        # If there is an unfinished current city, do it first
         current_city = progress.get("current_city", "")
         if current_city and current_city not in progress.get("completed_cities", []):
             print(f"♻️ Resuming unfinished city first: {current_city}")
@@ -894,11 +930,16 @@ def main():
                 google_batch.clear()
                 return
 
-        # Recompute remaining after possible current city completion
         remaining_cities = get_remaining_cities(progress, BNI_CITIES)
 
         for city in remaining_cities:
             try:
+                # reset queue for new city
+                progress["current_city"] = city
+                progress["city_queue"] = []
+                progress["city_index"] = 0
+                save_progress(progress)
+
                 completed = process_city(
                     search_page=search_page,
                     profile_page=profile_page,
