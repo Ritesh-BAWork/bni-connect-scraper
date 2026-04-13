@@ -70,10 +70,6 @@ def clean_phone(t: str) -> str:
     return digits if 8 <= len(digits) <= 15 else ""
 
 
-def is_phone(t: str) -> bool:
-    return bool(clean_phone(t))
-
-
 def save_html(page, filename: str) -> None:
     if not DEBUG_HTML:
         return
@@ -109,32 +105,14 @@ def is_bad_text_value(v: str) -> bool:
         "my bio",
         "profile",
         "training history",
-        "null",
-        "none",
         "city",
         "zip / postal code",
         "zip/postal code",
         "country",
+        "null",
+        "none",
     }
     return norm(v).lower() in bad
-
-
-def looks_like_address(v: str) -> bool:
-    low = norm(v).lower()
-    if not low or is_bad_text_value(low):
-        return False
-    if "@" in low or low.startswith("http"):
-        return False
-
-    keywords = [
-        "road", "rd", "street", "st", "nagar", "tower", "complex",
-        "floor", "lane", "building", "colony", "plot", "apartment",
-        "ward", "sector", "phase", "square", "ring road", "near",
-        "opp", "opposite", "layout", "flat no", "office no", "shop no",
-        "society", "marg", "chowk", "circle", "gate", "market", "naka",
-        "cross", "main road", "block", "suite", "west", "east", "north", "south"
-    ]
-    return any(k in low for k in keywords)
 
 
 def is_bad_website(url: str) -> bool:
@@ -148,7 +126,24 @@ def is_bad_website(url: str) -> bool:
         "instagram.com/share",
         "linkedin.com/share",
     ]
-    return any(b in low for b in bad_domains)
+    return any(x in low for x in bad_domains)
+
+
+def looks_like_address(v: str) -> bool:
+    low = norm(v).lower()
+    if not low or is_bad_text_value(low):
+        return False
+    if "@" in low or low.startswith("http"):
+        return False
+    keywords = [
+        "road", "rd", "street", "st", "nagar", "tower", "complex",
+        "floor", "lane", "building", "colony", "plot", "apartment",
+        "ward", "sector", "phase", "square", "ring road", "near",
+        "opp", "opposite", "layout", "flat no", "office no", "shop no",
+        "society", "marg", "chowk", "circle", "gate", "market", "naka",
+        "cross", "main road", "block", "suite", "west", "east", "north", "south"
+    ]
+    return any(k in low for k in keywords)
 
 
 # =========================================================
@@ -624,96 +619,68 @@ def collect_all_links_for_city(search_page, city: str, deadline: float) -> List[
 # =========================================================
 # PROFILE EXTRACTION
 # =========================================================
-def get_lines(page) -> List[str]:
-    try:
-        text = page.locator("body").inner_text()
-    except Exception:
-        return []
+def get_lines(text: str) -> List[str]:
     return [norm(x) for x in text.splitlines() if norm(x)]
 
 
-def get_card_content(page, heading_texts: List[str]) -> Dict:
-    """
-    Returns:
-    {
-      "text": "<card innerText>",
-      "links": [{"href": "...", "text": "..."}]
-    }
-    """
+def get_profile_blocks(page) -> Dict:
     script = """
-    (headings) => {
-        function norm(s) {
-            return (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    () => {
+        const headings = ["Personal Details", "Professional Details", "My Bio", "Bio"];
+        const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+        const out = {};
+
+        for (const heading of headings) {
+            out[heading] = { text: "", links: [] };
         }
 
-        const headingSet = new Set(headings.map(h => norm(h)));
         const all = Array.from(document.querySelectorAll('*'));
 
         for (const el of all) {
-            const txt = norm(el.innerText);
+            const txt = normalize(el.innerText);
             if (!txt) continue;
 
-            if (headingSet.has(txt)) {
-                let card = el;
-                for (let i = 0; i < 6; i++) {
-                    if (!card || !card.parentElement) break;
-                    card = card.parentElement;
-
-                    const cardText = norm(card.innerText);
-                    if (!cardText) continue;
-
-                    if (cardText.includes(txt) && cardText.length > txt.length + 20) {
-                        const links = Array.from(card.querySelectorAll('a[href]')).map(a => ({
-                            href: a.getAttribute('href') || '',
-                            text: (a.innerText || '').replace(/\\s+/g, ' ').trim()
-                        }));
-                        return {
-                            text: (card.innerText || '').replace(/\\s+/g, '\\n').replace(/\\n+/g, '\\n').trim(),
-                            links
-                        };
+            for (const heading of headings) {
+                if (txt === normalize(heading)) {
+                    let card = el;
+                    for (let i = 0; i < 6; i++) {
+                        if (!card || !card.parentElement) break;
+                        card = card.parentElement;
+                        const cardText = (card.innerText || '').trim();
+                        if (cardText && cardText.toLowerCase().includes(heading.toLowerCase()) && cardText.length > heading.length + 20) {
+                            out[heading] = {
+                                text: cardText,
+                                links: Array.from(card.querySelectorAll('a[href]')).map(a => ({
+                                    href: a.getAttribute('href') || '',
+                                    text: (a.innerText || '').replace(/\\s+/g, ' ').trim()
+                                }))
+                            };
+                            break;
+                        }
                     }
                 }
             }
         }
-        return {text: '', links: []};
+        return out;
     }
     """
     try:
-        return page.evaluate(script, heading_texts)
+        return page.evaluate(script)
     except Exception:
-        return {"text": "", "links": []}
+        return {
+            "Personal Details": {"text": "", "links": []},
+            "Professional Details": {"text": "", "links": []},
+            "My Bio": {"text": "", "links": []},
+            "Bio": {"text": "", "links": []},
+        }
 
 
-def find_value_after_labels(lines: List[str], labels: List[str]) -> str:
-    label_set = {norm(x).lower() for x in labels}
-
-    for i, line in enumerate(lines):
-        current = norm(line).lower().strip(": ")
-
-        if current in label_set:
-            for j in range(i + 1, min(i + 5, len(lines))):
-                nxt = norm(lines[j])
-                if nxt and norm(nxt).lower() not in label_set and not is_bad_text_value(nxt):
-                    return nxt
-
-        for lab in label_set:
-            if current.startswith(lab + ":"):
-                value = norm(line.split(":", 1)[1]) if ":" in line else ""
-                if value and not is_bad_text_value(value):
-                    return value
-
-    return ""
-
-
-def extract_anchor_data_from_card(card_links: List[Dict]) -> Dict:
+def extract_anchor_data(card_links: List[Dict]) -> Dict:
     data = {"emails": [], "phones": [], "websites": []}
 
     for item in card_links:
         href = norm(item.get("href", ""))
         text = norm(item.get("text", ""))
-
-        if not href:
-            continue
 
         if href.startswith("mailto:"):
             val = norm(href.replace("mailto:", ""))
@@ -728,14 +695,8 @@ def extract_anchor_data_from_card(card_links: List[Dict]) -> Dict:
             continue
 
         if href.startswith("http") and not is_bad_website(href):
-            try:
-                netloc = urlparse(href).netloc.lower()
-            except Exception:
-                netloc = ""
-            if netloc and href not in data["websites"]:
-                data["websites"].append(href)
+            data["websites"].append(href)
 
-        # Sometimes phone/email is only in link text
         if text and "@" in text and text not in data["emails"]:
             data["emails"].append(text)
 
@@ -746,38 +707,103 @@ def extract_anchor_data_from_card(card_links: List[Dict]) -> Dict:
     return data
 
 
-def find_address_from_personal_lines(lines: List[str]) -> str:
-    # Try labeled address first
-    addr = find_value_after_labels(lines, ["Address", "Office Address", "Business Address"])
-    if addr and not is_bad_text_value(addr):
-        return addr
+def extract_personal_details(personal_lines: List[str], personal_links: List[Dict]) -> Dict:
+    result = {
+        "Phone": "",
+        "Email": "",
+        "Website": "",
+        "Address": "",
+    }
 
-    # Screenshot pattern: address line appears before City / Zip / Country
-    for i, line in enumerate(lines):
-        if norm(line).lower() in {"city", "zip / postal code", "zip/postal code", "country"}:
-            for j in range(max(0, i - 3), i):
-                cand = norm(lines[j])
-                if cand and not is_bad_text_value(cand) and looks_like_address(cand):
-                    return cand
+    anchor = extract_anchor_data(personal_links)
 
-    # Heuristic fallback
-    for line in lines:
+    if anchor["phones"]:
+        result["Phone"] = " / ".join(anchor["phones"][:2])
+
+    if anchor["emails"]:
+        result["Email"] = anchor["emails"][0]
+
+    if anchor["websites"]:
+        result["Website"] = anchor["websites"][0]
+
+    # Fallback parse from visible lines
+    found_emails = []
+    found_phones = []
+    address_lines = []
+
+    skip_words = {
+        "personal details", "city", "zip / postal code", "zip/postal code", "country"
+    }
+
+    for line in personal_lines:
+        low = line.lower()
+
+        if low in skip_words:
+            continue
+
+        if not result["Email"]:
+            em = find_email(line)
+            if em and em not in found_emails:
+                found_emails.append(em)
+
+        cp = clean_phone(line)
+        if cp and cp not in found_phones:
+            found_phones.append(cp)
+
+        if not result["Website"]:
+            if line.startswith("http") and not is_bad_website(line):
+                result["Website"] = line
+
         if looks_like_address(line):
-            return line
+            address_lines.append(line)
 
-    return ""
+    if not result["Email"] and found_emails:
+        result["Email"] = found_emails[0]
+
+    if not result["Phone"] and found_phones:
+        result["Phone"] = " / ".join(found_phones[:2])
+
+    if address_lines:
+        result["Address"] = ", ".join(dict.fromkeys(address_lines))
+
+    # Stronger fallback: address before City / Zip / Country labels
+    if not result["Address"]:
+        for i, line in enumerate(personal_lines):
+            if line.lower() in {"city", "zip / postal code", "zip/postal code", "country"}:
+                block = []
+                for j in range(max(0, i - 3), i):
+                    cand = personal_lines[j]
+                    if looks_like_address(cand):
+                        block.append(cand)
+                if block:
+                    result["Address"] = ", ".join(dict.fromkeys(block))
+                    break
+
+    return result
 
 
-def derive_classification(profile_classification: str, industry_line: str) -> str:
-    if profile_classification and not is_bad_text_value(profile_classification):
-        return profile_classification
+def extract_professional_details(prof_lines: List[str], industry_line: str) -> Dict:
+    result = {
+        "Professional Classification": "",
+        "Business Description": "",
+    }
 
-    if ">" in industry_line:
+    clean_prof = [x for x in prof_lines if not is_bad_text_value(x)]
+
+    if clean_prof:
+        # Usually first meaningful line = classification
+        result["Professional Classification"] = clean_prof[0]
+
+    if len(clean_prof) >= 2:
+        # Usually second meaningful line = business description
+        result["Business Description"] = clean_prof[1]
+
+    if not result["Professional Classification"] and ">" in industry_line:
         parts = [norm(x) for x in industry_line.split(">")]
         if parts:
-            return parts[-1]
+            result["Professional Classification"] = parts[-1]
 
-    return ""
+    return result
 
 
 def extract_profile(page, member_industry: str = "") -> Dict:
@@ -798,94 +824,32 @@ def extract_profile(page, member_industry: str = "") -> Dict:
 
     save_html(page, "debug_current_profile.html")
 
-    all_lines = get_lines(page)
-    full_text = " ".join(all_lines)
+    blocks = get_profile_blocks(page)
 
-    personal_card = get_card_content(page, ["Personal Details"])
-    professional_card = get_card_content(page, ["Professional Details"])
-    bio_card = get_card_content(page, ["My Bio", "Bio"])
+    personal_text = blocks.get("Personal Details", {}).get("text", "")
+    prof_text = blocks.get("Professional Details", {}).get("text", "")
+    bio_text = blocks.get("My Bio", {}).get("text", "") or blocks.get("Bio", {}).get("text", "")
 
-    personal_lines = [norm(x) for x in personal_card.get("text", "").splitlines() if norm(x)]
-    professional_lines = [norm(x) for x in professional_card.get("text", "").splitlines() if norm(x)]
-    bio_lines = [norm(x) for x in bio_card.get("text", "").splitlines() if norm(x)]
+    personal_lines = get_lines(personal_text)
+    prof_lines = get_lines(prof_text)
+    bio_lines = get_lines(bio_text)
 
-    personal_links = personal_card.get("links", [])
-    personal_anchor_data = extract_anchor_data_from_card(personal_links)
+    personal_links = blocks.get("Personal Details", {}).get("links", [])
 
-    # EMAIL
-    if personal_anchor_data["emails"]:
-        det["Email"] = personal_anchor_data["emails"][0]
+    personal = extract_personal_details(personal_lines, personal_links)
+    prof = extract_professional_details(prof_lines, member_industry)
+
+    det["Phone"] = personal["Phone"]
+    det["Email"] = personal["Email"]
+    det["Website"] = personal["Website"]
+    det["Address"] = personal["Address"]
+    det["Professional Classification"] = prof["Professional Classification"]
+    det["Business Description"] = prof["Business Description"]
+
+    # Final fallback from full page
     if not det["Email"]:
-        val = find_value_after_labels(personal_lines, ["Email", "E-mail", "Mail"])
-        if val and "@" in val:
-            det["Email"] = val
-    if not det["Email"]:
+        full_text = " ".join(personal_lines + prof_lines + bio_lines)
         det["Email"] = find_email(full_text)
-
-    # PHONE
-    if personal_anchor_data["phones"]:
-        det["Phone"] = " / ".join(personal_anchor_data["phones"][:2])
-    if not det["Phone"]:
-        val = find_value_after_labels(personal_lines, ["Phone", "Mobile", "Contact", "Telephone"])
-        cp = clean_phone(val)
-        if cp:
-            det["Phone"] = cp
-    if not det["Phone"]:
-        phones = []
-        for line in personal_lines:
-            cp = clean_phone(line)
-            if cp and cp not in phones:
-                phones.append(cp)
-            if len(phones) >= 2:
-                break
-        if phones:
-            det["Phone"] = " / ".join(phones[:2])
-
-    # WEBSITE
-    if personal_anchor_data["websites"]:
-        det["Website"] = personal_anchor_data["websites"][0]
-    if not det["Website"]:
-        val = find_value_after_labels(personal_lines, ["Website", "Web", "URL"])
-        if val.startswith("http") and not is_bad_website(val):
-            det["Website"] = val
-
-    # ADDRESS
-    det["Address"] = find_address_from_personal_lines(personal_lines)
-
-    # CLASSIFICATION
-    raw_classification = find_value_after_labels(
-        professional_lines,
-        [
-            "Professional Classification",
-            "Classification",
-            "Category",
-            "Profession",
-            "Professional Details",
-        ],
-    )
-    det["Professional Classification"] = derive_classification(raw_classification, member_industry)
-
-    # BUSINESS DESCRIPTION
-    desc = find_value_after_labels(
-        professional_lines,
-        [
-            "Business Description",
-            "About Business",
-            "Description",
-        ],
-    )
-    if desc and not is_bad_text_value(desc):
-        det["Business Description"] = desc
-
-    if not det["Business Description"]:
-        # Professional details card in screenshot:
-        # line 1 = classification, line 2 = business description
-        clean_prof = [x for x in professional_lines if not is_bad_text_value(x)]
-        if len(clean_prof) >= 2:
-            if det["Professional Classification"] and clean_prof[0] == det["Professional Classification"]:
-                det["Business Description"] = clean_prof[1]
-            elif len(clean_prof) >= 2:
-                det["Business Description"] = clean_prof[1]
 
     if not det["Business Description"] and bio_lines:
         clean_bio = [x for x in bio_lines if not is_bad_text_value(x)]
@@ -1012,7 +976,7 @@ def main():
         raise Exception("Set BNI_EMAIL and BNI_PASSWORD first")
 
     print("=" * 70)
-    print("BNI Connect Scraper — Final Profile Card Extraction")
+    print("BNI Connect Scraper — Personal Details Card Parser")
     print(f"Cities    : {', '.join(BNI_CITIES)}")
     print(f"CSV       : {CSV_FILE}")
     print(f"Headless  : {HEADLESS}")
