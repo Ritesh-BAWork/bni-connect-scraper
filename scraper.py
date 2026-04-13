@@ -108,6 +108,8 @@ def is_bad_text_value(v: str) -> bool:
         "my bio",
         "profile",
         "training history",
+        "null",
+        "none",
     }
     return norm(v).lower() in bad
 
@@ -529,6 +531,39 @@ def get_members(page, city: str) -> List[Dict]:
     return cleaned
 
 
+def safe_scroll(search_page) -> None:
+    try:
+        search_page.evaluate("() => { window.scrollTo(0, document.body.scrollHeight); }")
+        search_page.wait_for_timeout(1500)
+    except Exception:
+        pass
+
+    try:
+        search_page.mouse.wheel(0, 4000)
+        search_page.wait_for_timeout(1500)
+    except Exception:
+        pass
+
+    try:
+        search_page.evaluate(
+            """
+            () => {
+                const els = Array.from(document.querySelectorAll('div'));
+                for (const el of els) {
+                    const s = window.getComputedStyle(el);
+                    if ((s.overflowY === 'auto' || s.overflowY === 'scroll') &&
+                        el.scrollHeight > el.clientHeight) {
+                        el.scrollTop = el.scrollHeight;
+                    }
+                }
+            }
+            """
+        )
+        search_page.wait_for_timeout(1500)
+    except Exception:
+        pass
+
+
 def collect_all_links_for_city(search_page, city: str, deadline: float) -> List[Dict]:
     open_real_search_page(search_page)
     search_city(search_page, city)
@@ -539,13 +574,24 @@ def collect_all_links_for_city(search_page, city: str, deadline: float) -> List[
     seen_urls: Set[str] = set()
     stable_rounds = 0
     previous_count = 0
-    max_scroll_rounds = 500
+    max_scroll_rounds = 600
 
     for _ in range(max_scroll_rounds):
         if should_stop(deadline):
             break
 
-        members = get_members(search_page, city)
+        try:
+            members = get_members(search_page, city)
+        except Exception as e:
+            print(f"⚠️ get_members issue in {city}: {e}")
+            try:
+                open_real_search_page(search_page)
+                search_city(search_page, city)
+                members = get_members(search_page, city)
+            except Exception as e2:
+                print(f"⚠️ Re-open search failed in {city}: {e2}")
+                break
+
         for m in members:
             if m["href"] not in seen_urls:
                 seen_urls.add(m["href"])
@@ -563,38 +609,13 @@ def collect_all_links_for_city(search_page, city: str, deadline: float) -> List[
             break
 
         previous_count = len(collected)
-
-        try:
-            search_page.evaluate("() => { window.scrollTo(0, document.body.scrollHeight); }")
-            search_page.wait_for_timeout(2000)
-
-            search_page.mouse.wheel(0, 4000)
-            search_page.wait_for_timeout(2000)
-
-            search_page.evaluate(
-                """
-                () => {
-                    const els = Array.from(document.querySelectorAll('div'));
-                    for (const el of els) {
-                        const s = window.getComputedStyle(el);
-                        if ((s.overflowY === 'auto' || s.overflowY === 'scroll') &&
-                            el.scrollHeight > el.clientHeight) {
-                            el.scrollTop = el.scrollHeight;
-                        }
-                    }
-                }
-                """
-            )
-            search_page.wait_for_timeout(2500)
-        except Exception as e:
-            print(f"⚠️ Scroll issue in {city}: {e}")
-            break
+        safe_scroll(search_page)
 
     return collected
 
 
 # =========================================================
-# PROFILE EXTRACTION - STRONGER
+# PROFILE EXTRACTION
 # =========================================================
 def get_lines(page) -> List[str]:
     try:
@@ -647,7 +668,6 @@ def extract_anchor_data(page) -> Dict:
                 continue
 
             if href.startswith("http") and not is_bad_website(href):
-                # Keep public-looking domains only
                 try:
                     netloc = urlparse(href).netloc.lower()
                 except Exception:
@@ -661,13 +681,10 @@ def extract_anchor_data(page) -> Dict:
 
 def find_address_from_lines(lines: List[str]) -> str:
     addr = find_value_after_labels(lines, ["Address", "Office Address", "Business Address"])
-    if addr and not is_bad_text_value(addr) and addr.lower() != "password":
+    if addr and not is_bad_text_value(addr):
         return addr
 
     for line in lines:
-        low = norm(line).lower()
-        if low == "password":
-            continue
         if looks_like_address(line):
             return line
 
@@ -700,7 +717,7 @@ def extract_profile(page, member_industry: str = "") -> Dict:
         page.wait_for_load_state("networkidle", timeout=12000)
     except Exception:
         pass
-    page.wait_for_timeout(2500)
+    page.wait_for_timeout(2000)
 
     save_html(page, "debug_current_profile.html")
 
@@ -708,7 +725,7 @@ def extract_profile(page, member_industry: str = "") -> Dict:
     full = " ".join(lines)
     anchor_data = extract_anchor_data(page)
 
-    # Email
+    # EMAIL
     if anchor_data["emails"]:
         det["Email"] = anchor_data["emails"][0]
     if not det["Email"]:
@@ -718,7 +735,7 @@ def extract_profile(page, member_industry: str = "") -> Dict:
     if not det["Email"]:
         det["Email"] = find_email(full)
 
-    # Phone
+    # PHONE
     if anchor_data["phones"]:
         det["Phone"] = " / ".join(anchor_data["phones"][:2])
     if not det["Phone"]:
@@ -737,7 +754,7 @@ def extract_profile(page, member_industry: str = "") -> Dict:
         if phones:
             det["Phone"] = " / ".join(phones[:2])
 
-    # Website
+    # WEBSITE
     if anchor_data["websites"]:
         det["Website"] = anchor_data["websites"][0]
     if not det["Website"]:
@@ -745,10 +762,10 @@ def extract_profile(page, member_industry: str = "") -> Dict:
         if val.startswith("http") and not is_bad_website(val):
             det["Website"] = val
 
-    # Address
+    # ADDRESS
     det["Address"] = find_address_from_lines(lines)
 
-    # Classification
+    # CLASSIFICATION
     raw_classification = find_value_after_labels(
         lines,
         [
@@ -760,7 +777,7 @@ def extract_profile(page, member_industry: str = "") -> Dict:
     )
     det["Professional Classification"] = derive_classification(raw_classification, member_industry)
 
-    # Business description
+    # BUSINESS DESCRIPTION
     desc = find_value_after_labels(
         lines,
         [
@@ -800,7 +817,7 @@ def scrape_one_profile(profile_page, member: Dict, city: str) -> Optional[Dict]:
 
     try:
         profile_page.goto(url, wait_until="domcontentloaded", timeout=25000)
-        profile_page.wait_for_timeout(2500)
+        profile_page.wait_for_timeout(2000)
     except Exception as e:
         print(f"⚠️ Cannot open profile: {e}")
         return None
@@ -912,7 +929,7 @@ def main():
         raise Exception("Set BNI_EMAIL and BNI_PASSWORD first")
 
     print("=" * 70)
-    print("BNI Connect Scraper — Queue Resume + Improved Extraction")
+    print("BNI Connect Scraper — Queue Resume + Improved Extraction + Safe Scroll")
     print(f"Cities    : {', '.join(BNI_CITIES)}")
     print(f"CSV       : {CSV_FILE}")
     print(f"Headless  : {HEADLESS}")
