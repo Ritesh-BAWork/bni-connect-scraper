@@ -3,7 +3,8 @@ import json
 import os
 import re
 import time
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Optional
+from urllib.parse import urlparse
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -64,16 +65,13 @@ def find_email(t: str) -> str:
     return m.group(0) if m else ""
 
 
-def is_phone(t: str) -> bool:
-    if re.search(r"\d{2}/\d{2}/\d{4}", t or ""):
-        return False
-    digits = re.sub(r"\D", "", t or "")
-    return 8 <= len(digits) <= 15
-
-
 def clean_phone(t: str) -> str:
     digits = re.sub(r"\D", "", t or "")
     return digits if 8 <= len(digits) <= 15 else ""
+
+
+def is_phone(t: str) -> bool:
+    return bool(clean_phone(t))
 
 
 def save_html(page, filename: str) -> None:
@@ -93,6 +91,55 @@ def make_deadline() -> float:
 
 def should_stop(deadline: float) -> bool:
     return time.time() >= (deadline - SAFE_EXIT_BUFFER_SECONDS)
+
+
+def is_bad_text_value(v: str) -> bool:
+    bad = {
+        "",
+        "password",
+        "email",
+        "phone",
+        "mobile",
+        "contact",
+        "website",
+        "address",
+        "classification",
+        "professional details",
+        "my bio",
+        "profile",
+        "training history",
+    }
+    return norm(v).lower() in bad
+
+
+def looks_like_address(v: str) -> bool:
+    low = norm(v).lower()
+    if not low or is_bad_text_value(low):
+        return False
+    if "@" in low or low.startswith("http"):
+        return False
+    keywords = [
+        "road", "rd", "street", "st", "nagar", "tower", "complex",
+        "floor", "lane", "building", "colony", "plot", "apartment",
+        "ward", "sector", "phase", "square", "ring road", "near",
+        "opp", "opposite", "layout", "flat no", "office no", "shop no",
+        "society", "marg", "chowk", "circle", "gate", "market", "naka",
+        "cross", "main road", "block", "suite"
+    ]
+    return any(k in low for k in keywords)
+
+
+def is_bad_website(url: str) -> bool:
+    if not url:
+        return True
+    low = url.lower()
+    bad_domains = [
+        "bniconnectglobal.com",
+        "bnitos.com",
+        "facebook.com/share",
+        "wa.me/share",
+    ]
+    return any(b in low for b in bad_domains)
 
 
 # =========================================================
@@ -518,11 +565,7 @@ def collect_all_links_for_city(search_page, city: str, deadline: float) -> List[
         previous_count = len(collected)
 
         try:
-            search_page.evaluate(
-                """
-                () => { window.scrollTo(0, document.body.scrollHeight); }
-                """
-            )
+            search_page.evaluate("() => { window.scrollTo(0, document.body.scrollHeight); }")
             search_page.wait_for_timeout(2000)
 
             search_page.mouse.wheel(0, 4000)
@@ -551,7 +594,7 @@ def collect_all_links_for_city(search_page, city: str, deadline: float) -> List[
 
 
 # =========================================================
-# PROFILE EXTRACTION - IMPROVED
+# PROFILE EXTRACTION - STRONGER
 # =========================================================
 def get_lines(page) -> List[str]:
     try:
@@ -562,57 +605,88 @@ def get_lines(page) -> List[str]:
 
 
 def find_value_after_labels(lines: List[str], labels: List[str]) -> str:
-    label_set = {x.lower() for x in labels}
+    label_set = {norm(x).lower() for x in labels}
+
     for i, line in enumerate(lines):
-        low = line.lower().strip(": ")
-        if low in label_set:
-            if i + 1 < len(lines):
-                nxt = norm(lines[i + 1])
-                if nxt and nxt.lower() not in label_set:
+        current = norm(line).lower().strip(": ")
+
+        if current in label_set:
+            for j in range(i + 1, min(i + 4, len(lines))):
+                nxt = norm(lines[j])
+                if nxt and norm(nxt).lower() not in label_set and not is_bad_text_value(nxt):
                     return nxt
+
         for lab in label_set:
-            if line.lower().startswith(lab + ":"):
-                return norm(line.split(":", 1)[1])
+            if current.startswith(lab + ":"):
+                value = norm(line.split(":", 1)[1]) if ":" in line else ""
+                if value and not is_bad_text_value(value):
+                    return value
+
     return ""
 
 
+def extract_anchor_data(page) -> Dict:
+    data = {"emails": [], "phones": [], "websites": []}
+    try:
+        link_count = page.locator("a[href]").count()
+        for i in range(link_count):
+            href = (page.locator("a[href]").nth(i).get_attribute("href") or "").strip()
+            if not href:
+                continue
+
+            if href.startswith("mailto:"):
+                mail = norm(href.replace("mailto:", ""))
+                if mail and mail not in data["emails"]:
+                    data["emails"].append(mail)
+                continue
+
+            if href.startswith("tel:"):
+                phone = clean_phone(href.replace("tel:", ""))
+                if phone and phone not in data["phones"]:
+                    data["phones"].append(phone)
+                continue
+
+            if href.startswith("http") and not is_bad_website(href):
+                # Keep public-looking domains only
+                try:
+                    netloc = urlparse(href).netloc.lower()
+                except Exception:
+                    netloc = ""
+                if netloc and href not in data["websites"]:
+                    data["websites"].append(href)
+    except Exception:
+        pass
+    return data
+
+
 def find_address_from_lines(lines: List[str]) -> str:
-    bad_address_phrases = [
-        "i look forward",
-        "happy to write",
-        "construction & building materials",
-        "advertising & marketing",
-        "real estate services",
-        "travel agent",
-        "consulting",
-    ]
-
-    address_keywords = [
-        "road", "rd", "street", "st", "nagar", "tower", "complex",
-        "floor", "lane", "building", "colony", "plot", "apartment",
-        "ward", "sector", "phase", "square", "ring road", "near",
-        "opp", "opposite", "layout", "flat no", "office no", "shop no"
-    ]
-
-    # Try labeled address first
     addr = find_value_after_labels(lines, ["Address", "Office Address", "Business Address"])
-    if addr:
+    if addr and not is_bad_text_value(addr) and addr.lower() != "password":
         return addr
 
-    # Then heuristic
     for line in lines:
-        low = line.lower()
-        if any(p in low for p in bad_address_phrases):
+        low = norm(line).lower()
+        if low == "password":
             continue
-        if "@" in low or low.startswith("http"):
-            continue
-        if any(k in low for k in address_keywords):
+        if looks_like_address(line):
             return line
 
     return ""
 
 
-def extract_profile(page) -> Dict:
+def derive_classification(profile_classification: str, industry_line: str) -> str:
+    if profile_classification and not is_bad_text_value(profile_classification):
+        return profile_classification
+
+    if ">" in industry_line:
+        parts = [norm(x) for x in industry_line.split(">")]
+        if parts:
+            return parts[-1]
+
+    return ""
+
+
+def extract_profile(page, member_industry: str = "") -> Dict:
     det = {
         "Phone": "",
         "Email": "",
@@ -632,95 +706,62 @@ def extract_profile(page) -> Dict:
 
     lines = get_lines(page)
     full = " ".join(lines)
+    anchor_data = extract_anchor_data(page)
 
-    # EMAIL
-    try:
-        mailtos = page.query_selector_all('a[href^="mailto:"]')
-        for m in mailtos:
-            href = (m.get_attribute("href") or "").replace("mailto:", "").strip()
-            if href:
-                det["Email"] = href
-                break
-    except Exception:
-        pass
+    # Email
+    if anchor_data["emails"]:
+        det["Email"] = anchor_data["emails"][0]
     if not det["Email"]:
-        det["Email"] = find_value_after_labels(lines, ["Email", "E-mail", "Mail"])
+        val = find_value_after_labels(lines, ["Email", "E-mail", "Mail"])
+        if val and "@" in val:
+            det["Email"] = val
     if not det["Email"]:
         det["Email"] = find_email(full)
 
-    # PHONE
-    phone_candidates = []
-    try:
-        tels = page.query_selector_all('a[href^="tel:"]')
-        for t in tels:
-            href = (t.get_attribute("href") or "").replace("tel:", "").strip()
-            cp = clean_phone(href)
-            if cp and cp not in phone_candidates:
-                phone_candidates.append(cp)
-    except Exception:
-        pass
-
-    if not phone_candidates:
-        direct_phone = find_value_after_labels(lines, ["Phone", "Mobile", "Contact", "Telephone"])
-        cp = clean_phone(direct_phone)
+    # Phone
+    if anchor_data["phones"]:
+        det["Phone"] = " / ".join(anchor_data["phones"][:2])
+    if not det["Phone"]:
+        val = find_value_after_labels(lines, ["Phone", "Mobile", "Contact", "Telephone"])
+        cp = clean_phone(val)
         if cp:
-            phone_candidates.append(cp)
-
-    if not phone_candidates:
+            det["Phone"] = cp
+    if not det["Phone"]:
+        phones = []
         for line in lines:
             cp = clean_phone(line)
-            if cp and cp not in phone_candidates:
-                phone_candidates.append(cp)
-            if len(phone_candidates) >= 2:
+            if cp and cp not in phones:
+                phones.append(cp)
+            if len(phones) >= 2:
                 break
+        if phones:
+            det["Phone"] = " / ".join(phones[:2])
 
-    if phone_candidates:
-        det["Phone"] = " / ".join(phone_candidates[:2])
-
-    # WEBSITE
-    try:
-        link_count = page.locator("a[href]").count()
-        for i in range(link_count):
-            href = (page.locator("a[href]").nth(i).get_attribute("href") or "").strip()
-            low = href.lower()
-            if (
-                href.startswith("http")
-                and "bniconnect" not in low
-                and not low.startswith("mailto:")
-                and not low.startswith("tel:")
-                and "#" not in href
-            ):
-                det["Website"] = href
-                break
-    except Exception:
-        pass
+    # Website
+    if anchor_data["websites"]:
+        det["Website"] = anchor_data["websites"][0]
     if not det["Website"]:
-        det["Website"] = find_value_after_labels(lines, ["Website", "Web", "URL"])
+        val = find_value_after_labels(lines, ["Website", "Web", "URL"])
+        if val.startswith("http") and not is_bad_website(val):
+            det["Website"] = val
 
-    # ADDRESS
+    # Address
     det["Address"] = find_address_from_lines(lines)
 
-    # CLASSIFICATION
-    det["Professional Classification"] = find_value_after_labels(
+    # Classification
+    raw_classification = find_value_after_labels(
         lines,
         [
             "Professional Classification",
             "Classification",
             "Category",
             "Profession",
-            "Professional Details",
         ],
     )
+    det["Professional Classification"] = derive_classification(raw_classification, member_industry)
 
-    # Better fallback for classification:
-    if not det["Professional Classification"]:
-        for line in lines:
-            if " > " in line:
-                det["Professional Classification"] = line
-                break
-
-    # BUSINESS DESCRIPTION
-    det["Business Description"] = find_value_after_labels(
+    # Business description
+    desc = find_value_after_labels(
         lines,
         [
             "Business Description",
@@ -730,27 +771,31 @@ def extract_profile(page) -> Dict:
             "Bio",
         ],
     )
+    if desc and not is_bad_text_value(desc):
+        det["Business Description"] = desc
 
-    # More reliable section fallback
     if not det["Business Description"]:
-        in_prof = False
-        collected = []
-        stop_markers = {"Training History", "‹", "›", "Profile"}
+        bio_lines = []
+        capture = False
         for line in lines:
-            if line in {"My Bio", "Bio"}:
-                in_prof = True
+            low = line.lower()
+            if low in {"my bio", "bio", "business description", "about business"}:
+                capture = True
                 continue
-            if in_prof:
-                if line in stop_markers:
+            if capture:
+                if low in {"training history", "profile", "professional details"}:
                     break
-                collected.append(line)
-        if collected:
-            det["Business Description"] = " ".join(collected[:3])
+                if not is_bad_text_value(line):
+                    bio_lines.append(line)
+            if len(bio_lines) >= 3:
+                break
+        if bio_lines:
+            det["Business Description"] = " ".join(bio_lines)
 
     return det
 
 
-def scrape_one_profile(profile_page, member: Dict, city: str) -> Dict | None:
+def scrape_one_profile(profile_page, member: Dict, city: str) -> Optional[Dict]:
     url = member["href"]
 
     try:
@@ -760,7 +805,7 @@ def scrape_one_profile(profile_page, member: Dict, city: str) -> Dict | None:
         print(f"⚠️ Cannot open profile: {e}")
         return None
 
-    prof = extract_profile(profile_page)
+    prof = extract_profile(profile_page, member.get("industry", ""))
 
     final = {
         "Search City": city,
@@ -792,7 +837,7 @@ def scrape_one_profile(profile_page, member: Dict, city: str) -> Dict | None:
 
 
 # =========================================================
-# PROCESS ONE CITY FULLY, THEN NEXT CITY
+# PROCESS CITY
 # =========================================================
 def process_city(
     search_page,
@@ -867,7 +912,7 @@ def main():
         raise Exception("Set BNI_EMAIL and BNI_PASSWORD first")
 
     print("=" * 70)
-    print("BNI Connect Scraper — Queue Resume + Better Extraction")
+    print("BNI Connect Scraper — Queue Resume + Improved Extraction")
     print(f"Cities    : {', '.join(BNI_CITIES)}")
     print(f"CSV       : {CSV_FILE}")
     print(f"Headless  : {HEADLESS}")
@@ -934,7 +979,6 @@ def main():
 
         for city in remaining_cities:
             try:
-                # reset queue for new city
                 progress["current_city"] = city
                 progress["city_queue"] = []
                 progress["city_index"] = 0
