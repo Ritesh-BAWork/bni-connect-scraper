@@ -1,1095 +1,206 @@
+import os
 import csv
 import json
-import os
-import re
 import time
-from typing import Dict, List, Set, Optional
-from urllib.parse import urlparse
-
+import re
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
-
-# =========================================================
-# CONFIG
-# =========================================================
+# ================= CONFIG =================
 BNI_EMAIL = os.getenv("BNI_EMAIL", "").strip()
 BNI_PASSWORD = os.getenv("BNI_PASSWORD", "").strip()
 BNI_CITIES = [c.strip() for c in os.getenv("BNI_CITIES", "Nagpur").split(",") if c.strip()]
 
-LOGIN_URL = "https://www.bniconnectglobal.com/login/"
-DASHBOARD_URL = "https://www.bniconnectglobal.com/web/dashboard"
-SEARCH_URL = "https://www.bniconnectglobal.com/web/dashboard/search"
-
-HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-SLOW_MO = int(os.getenv("SLOW_MO", "0"))
-CSV_FILE = os.getenv("CSV_FILE", "bni_members.csv")
 GOOGLE_WEBAPP_URL = os.getenv("GOOGLE_WEBAPP_URL", "").strip()
-DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+
+CSV_FILE = os.getenv("CSV_FILE", "bni_members.csv")
 PROGRESS_FILE = os.getenv("PROGRESS_FILE", "progress_state.json")
 
-MAX_RUN_MINUTES = int(os.getenv("MAX_RUN_MINUTES", "330"))
-SAFE_EXIT_BUFFER_SECONDS = int(os.getenv("SAFE_EXIT_BUFFER_SECONDS", "300"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
-
-
-# =========================================================
-# OUTPUT COLUMNS
-# =========================================================
-HEADERS = [
-    "Search City",
-    "Name",
-    "Chapter",
-    "Company",
-    "City",
-    "Industry and Classification",
-    "Profile URL",
-    "Phone",
-    "Email",
-    "Website",
-    "Address",
-    "Professional Classification",
-    "Business Description",
-]
-
-
-# =========================================================
-# BASIC HELPERS
-# =========================================================
-def norm(t: str) -> str:
-    return re.sub(r"\s+", " ", t or "").strip()
-
-
-def find_email(t: str) -> str:
-    m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", t or "")
-    return m.group(0) if m else ""
-
-
-def clean_phone(t: str) -> str:
-    digits = re.sub(r"\D", "", t or "")
-    return digits if 8 <= len(digits) <= 15 else ""
-
-
-def save_html(page, filename: str) -> None:
-    if not DEBUG_HTML:
-        return
-    try:
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(page.content())
-        print(f"💾 Saved HTML: {filename}")
-    except Exception as e:
-        print(f"⚠️ Could not save HTML {filename}: {e}")
-
-
-def make_deadline() -> float:
-    return time.time() + (MAX_RUN_MINUTES * 60)
-
-
-def should_stop(deadline: float) -> bool:
-    return time.time() >= (deadline - SAFE_EXIT_BUFFER_SECONDS)
-
-
-def is_bad_text_value(v: str) -> bool:
-    bad = {
-        "",
-        "password",
-        "email",
-        "phone",
-        "mobile",
-        "contact",
-        "website",
-        "address",
-        "classification",
-        "professional details",
-        "personal details",
-        "my bio",
-        "profile",
-        "training history",
-        "city",
-        "zip / postal code",
-        "zip/postal code",
-        "country",
-        "null",
-        "none",
-    }
-    return norm(v).lower() in bad
-
-
-def is_bad_website(url: str) -> bool:
-    if not url:
-        return True
-    low = url.lower()
-    bad_domains = [
-        "bniconnectglobal.com",
-        "facebook.com/share",
-        "wa.me/share",
-        "instagram.com/share",
-        "linkedin.com/share",
-    ]
-    return any(x in low for x in bad_domains)
-
-
-def looks_like_address(v: str) -> bool:
-    low = norm(v).lower()
-    if not low or is_bad_text_value(low):
-        return False
-    if "@" in low or low.startswith("http"):
-        return False
-    keywords = [
-        "road", "rd", "street", "st", "nagar", "tower", "complex",
-        "floor", "lane", "building", "colony", "plot", "apartment",
-        "ward", "sector", "phase", "square", "ring road", "near",
-        "opp", "opposite", "layout", "flat no", "office no", "shop no",
-        "society", "marg", "chowk", "circle", "gate", "market", "naka",
-        "cross", "main road", "block", "suite", "west", "east", "north", "south"
-    ]
-    return any(k in low for k in keywords)
-
-
-# =========================================================
-# CSV
-# =========================================================
-def init_csv() -> None:
-    if os.path.exists(CSV_FILE):
-        print(f"📄 CSV exists: {CSV_FILE}")
-        return
-    with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
-        csv.writer(f).writerow(HEADERS)
-    print(f"📄 CSV ready: {CSV_FILE}")
-
-
-def append_csv(row: Dict) -> None:
-    with open(CSV_FILE, "a", newline="", encoding="utf-8-sig") as f:
-        csv.writer(f).writerow([row.get(h, "") for h in HEADERS])
-
-
-def load_done_urls_from_csv() -> Set[str]:
-    done = set()
+# ================= CSV =================
+def init_csv():
     if not os.path.exists(CSV_FILE):
-        return done
-    try:
-        with open(CSV_FILE, "r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                url = norm(row.get("Profile URL", ""))
-                if url:
-                    done.add(url)
-    except Exception as e:
-        print(f"⚠️ Could not read existing CSV for resume: {e}")
-    return done
+        with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "City","Name","Phone","Email","Website","Address","Classification"
+            ])
 
+def append_csv(row):
+    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(row)
 
-# =========================================================
-# GOOGLE SHEET
-# =========================================================
-def flush_google_batch(batch_rows: List[Dict]) -> None:
-    if not batch_rows:
+# ================= PROGRESS =================
+def load_progress():
+    if os.path.exists(PROGRESS_FILE):
+        return json.load(open(PROGRESS_FILE))
+    return {"completed_cities": []}
+
+def save_progress(p):
+    json.dump(p, open(PROGRESS_FILE, "w"))
+
+# ================= GOOGLE =================
+def push_to_sheet(row):
+    if not GOOGLE_WEBAPP_URL or "YOUR" in GOOGLE_WEBAPP_URL:
         return
-
-    if not GOOGLE_WEBAPP_URL or GOOGLE_WEBAPP_URL == "YOUR_URL":
-        print("ℹ️ GOOGLE_WEBAPP_URL not set. Skipping Google Sheet upload.")
-        return
-
-    payload = {"rows": batch_rows}
-
-    for attempt in range(1, 4):
-        try:
-            r = requests.post(GOOGLE_WEBAPP_URL, json=payload, timeout=120)
-            print(f"📤 Apps Script POST: {r.status_code} | batch={len(batch_rows)}")
-            print(f"📤 Response: {r.text[:200]}")
-            if r.ok:
-                return
-        except Exception as e:
-            print(f"⚠️ POST failed (attempt {attempt}): {e}")
-        time.sleep(2)
-
-    print("❌ Failed to push data batch to Google Sheet")
-
-
-# =========================================================
-# PROGRESS / RESUME
-# =========================================================
-def default_progress() -> Dict:
-    return {
-        "completed_cities": [],
-        "done_urls": [],
-        "current_city": "",
-        "city_queue": [],
-        "city_index": 0,
-        "last_saved_at": "",
-    }
-
-
-def load_progress() -> Dict:
-    if not os.path.exists(PROGRESS_FILE):
-        return default_progress()
     try:
-        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        base = default_progress()
-        base.update(data)
-        return base
-    except Exception as e:
-        print(f"⚠️ Could not read progress file, starting fresh: {e}")
-        return default_progress()
+        requests.post(GOOGLE_WEBAPP_URL, json=row, timeout=10)
+    except:
+        pass
 
+# ================= LOGIN =================
+def login(page):
+    print("🔐 Login...")
+    page.goto("https://www.bniconnectglobal.com/login/")
+    page.fill('input[name="username"]', BNI_EMAIL)
+    page.fill('input[name="password"]', BNI_PASSWORD)
+    page.click('button[type="submit"]')
+    page.wait_for_timeout(5000)
+    print("✅ Login done")
 
-def save_progress(progress: Dict) -> None:
-    try:
-        progress["last_saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-            json.dump(progress, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"⚠️ Could not save progress file: {e}")
+# ================= SEARCH =================
+def open_search(page):
+    page.goto("https://www.bniconnectglobal.com/web/dashboard/search")
+    page.wait_for_timeout(5000)
 
-
-def mark_url_done(progress: Dict, url: str) -> None:
-    if url and url not in progress["done_urls"]:
-        progress["done_urls"].append(url)
-
-
-def mark_city_completed(progress: Dict, city: str) -> None:
-    if city not in progress["completed_cities"]:
-        progress["completed_cities"].append(city)
-    progress["current_city"] = ""
-    progress["city_queue"] = []
-    progress["city_index"] = 0
-    save_progress(progress)
-
-
-def get_remaining_cities(progress: Dict, all_cities: List[str]) -> List[str]:
-    completed = set(progress.get("completed_cities", []))
-    return [c for c in all_cities if c not in completed]
-
-
-# =========================================================
-# PLAYWRIGHT HELPERS
-# =========================================================
-def click_first_visible(page, selectors: List[str], timeout_ms: int = 3000) -> bool:
-    for sel in selectors:
-        try:
-            locator = page.locator(sel)
-            count = locator.count()
-            for i in range(count):
-                try:
-                    el = locator.nth(i)
-                    if el.is_visible(timeout=1000):
-                        el.click(timeout=timeout_ms)
-                        return True
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    return False
-
-
-def fill_first_visible(page, selectors: List[str], value: str, press_enter: bool = False) -> bool:
-    for sel in selectors:
-        try:
-            locator = page.locator(sel)
-            count = locator.count()
-            for i in range(count):
-                try:
-                    el = locator.nth(i)
-                    if el.is_visible(timeout=1000):
-                        el.click(timeout=2000)
-                        try:
-                            el.press("Control+A")
-                            el.press("Backspace")
-                        except Exception:
-                            pass
-                        el.fill(value)
-                        if press_enter:
-                            el.press("Enter")
-                        return True
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    return False
-
-
-# =========================================================
-# LOGIN
-# =========================================================
-def login(page) -> None:
-    print("\n🔐 Logging in...")
-    page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(2500)
-    save_html(page, "debug_login_page.html")
-
-    email_ok = fill_first_visible(
-        page,
-        [
-            'input[name="username"]',
-            'input[name="email"]',
-            'input[type="email"]',
-            'input[placeholder*="Email"]',
-            'input[placeholder*="Username"]',
-        ],
-        BNI_EMAIL,
-    )
-    if not email_ok:
-        raise Exception("Could not find email/username input")
-
-    password_ok = fill_first_visible(
-        page,
-        [
-            'input[name="password"]',
-            'input[type="password"]',
-        ],
-        BNI_PASSWORD,
-    )
-    if not password_ok:
-        raise Exception("Could not find password input")
-
-    clicked = click_first_visible(
-        page,
-        [
-            'button[type="submit"]',
-            'input[type="submit"]',
-            'button:has-text("Sign In")',
-            'button:has-text("Login")',
-            'button:has-text("SIGN IN")',
-        ],
-        timeout_ms=5000,
-    )
-    if not clicked:
-        raise Exception("Could not click login button")
+# ================= 🔥 FIXED EXTRACTION =================
+def extract_data(page):
+    data = {"phone":"","email":"","website":"","address":"","classification":""}
 
     try:
-        page.wait_for_url("**/web/dashboard**", timeout=30000)
-    except PlaywrightTimeoutError:
-        save_html(page, "debug_login_failed_after_submit.html")
-        raise Exception(f"Login did not reach dashboard. Current URL: {page.url}")
-
-    page.wait_for_timeout(3000)
-    save_html(page, "debug_after_login.html")
-    print(f"✅ Login successful: {page.url}")
-
-
-# =========================================================
-# SEARCH PAGE
-# =========================================================
-def open_real_search_page(page) -> None:
-    print("🧭 Opening Search Members page...")
-
-    if "/web/dashboard" not in page.url:
-        page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
         page.wait_for_timeout(3000)
 
-    save_html(page, "debug_dashboard_before_search_click.html")
+        # scroll (important)
+        for _ in range(3):
+            page.mouse.wheel(0, 3000)
+            page.wait_for_timeout(1000)
 
-    clicked = click_first_visible(
-        page,
-        [
-            'a:has-text("Search Members")',
-            'a:has-text("Member Search")',
-            'a:has-text("Find Members")',
-            'a:has-text("Members")',
-            'button:has-text("Search Members")',
-            'button:has-text("Member Search")',
-            'button:has-text("Members")',
-            'a[href*="/web/dashboard/search"]',
-            'a[href*="dashboard/search"]',
-            'a[href*="search"]',
-        ],
-        timeout_ms=5000,
-    )
+        text = page.inner_text("body")
 
-    if clicked:
-        page.wait_for_timeout(4000)
-        print(f"✅ Search page opened by click: {page.url}")
-    else:
-        print("ℹ️ Dashboard click path not found, using direct search URL fallback")
-        page.goto(SEARCH_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(4000)
+        # EMAIL
+        emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+        if emails:
+            data["email"] = emails[0]
 
-    save_html(page, "debug_search_page_opened.html")
+        # PHONE
+        phones = re.findall(r"\+?\d[\d\s\-]{8,15}", text)
+        if phones:
+            data["phone"] = " / ".join(list(set(phones[:2])))
 
+        # WEBSITE
+        sites = re.findall(r"https?://[^\s]+", text)
+        if sites:
+            data["website"] = sites[0]
 
-def search_city(page, city: str) -> None:
-    print(f"\n🔍 Searching city: {city}")
-
-    search_ok = fill_first_visible(
-        page,
-        [
-            'input[type="search"]',
-            'input[placeholder*="Search"]',
-            'input[placeholder*="search"]',
-            'input[placeholder*="City"]',
-            'input[name*="search"]',
-            'input[type="text"]',
-        ],
-        city,
-        press_enter=True,
-    )
-
-    if not search_ok:
-        save_html(page, f"debug_no_search_input_{city}.html")
-        raise Exception(f"Could not find search input for city: {city}")
-
-    click_first_visible(
-        page,
-        [
-            'button:has-text("Search")',
-            'button:has-text("Apply")',
-            'button:has-text("Filter")',
-            'a:has-text("Search")',
-        ],
-        timeout_ms=2000,
-    )
-
-    page.wait_for_timeout(6000)
-    save_html(page, f"debug_results_{city}.html")
-    print("✅ Search completed")
-
-
-# =========================================================
-# MEMBER LIST
-# =========================================================
-def get_members(page, city: str) -> List[Dict]:
-    results = page.evaluate(
-        """
-        (searchCity) => {
-            const members = [];
-            const rows = Array.from(document.querySelectorAll('div'))
-                .filter(el => {
-                    const c = (el.className || '').toString();
-                    return c.includes('css-1rb62l');
-                });
-
-            for (const row of rows) {
-                const link = row.querySelector('a[href*="networkHome?userId"]');
-                if (!link) continue;
-
-                const name = (link.innerText || '').replace(/\\s+/g, ' ').trim();
-                let href = link.getAttribute('href') || '';
-                if (href.startsWith('/')) href = 'https://www.bniconnectglobal.com' + href;
-                if (!name || !href) continue;
-
-                const texts = Array.from(row.querySelectorAll('*'))
-                    .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
-                    .filter(Boolean);
-
-                const uniqueTexts = [...new Set(texts)];
-
-                let chapter = uniqueTexts.find(x => /^BNI\\s/i.test(x)) || '';
-                let cityVal = uniqueTexts.find(x => x.toLowerCase() === searchCity.toLowerCase()) || searchCity;
-                let industry = uniqueTexts.find(x => x.includes('>')) || '';
-
-                let company = '';
-                for (const x of uniqueTexts) {
-                    if (
-                        x !== name &&
-                        x !== chapter &&
-                        x !== cityVal &&
-                        x !== industry &&
-                        x !== '+' &&
-                        x.toLowerCase() !== 'connect' &&
-                        !/^BNI\\s/i.test(x) &&
-                        !x.includes('>')
-                    ) {
-                        company = x;
-                        break;
-                    }
-                }
-
-                members.push({
-                    name,
-                    href,
-                    chapter,
-                    company,
-                    city: cityVal,
-                    industry
-                });
-            }
-
-            const seen = new Set();
-            return members.filter(m => {
-                if (seen.has(m.href)) return false;
-                seen.add(m.href);
-                return true;
-            });
-        }
-        """,
-        city,
-    )
-
-    cleaned = []
-    for r in results:
-        name = norm(r.get("name", ""))
-        href = norm(r.get("href", ""))
-        if not name or not href:
-            continue
-        cleaned.append({
-            "name": name,
-            "href": href,
-            "chapter": norm(r.get("chapter", "")),
-            "company": norm(r.get("company", "")),
-            "city": norm(r.get("city", "")) or city,
-            "industry": norm(r.get("industry", "")),
-        })
-    return cleaned
-
-
-def safe_scroll(search_page) -> None:
-    try:
-        search_page.evaluate("() => { window.scrollTo(0, document.body.scrollHeight); }")
-        search_page.wait_for_timeout(1500)
-    except Exception:
-        pass
-
-    try:
-        search_page.mouse.wheel(0, 4000)
-        search_page.wait_for_timeout(1500)
-    except Exception:
-        pass
-
-    try:
-        search_page.evaluate(
-            """
-            () => {
-                const els = Array.from(document.querySelectorAll('div'));
-                for (const el of els) {
-                    const s = window.getComputedStyle(el);
-                    if ((s.overflowY === 'auto' || s.overflowY === 'scroll') &&
-                        el.scrollHeight > el.clientHeight) {
-                        el.scrollTop = el.scrollHeight;
-                    }
-                }
-            }
-            """
-        )
-        search_page.wait_for_timeout(1500)
-    except Exception:
-        pass
-
-
-def collect_all_links_for_city(search_page, city: str, deadline: float) -> List[Dict]:
-    open_real_search_page(search_page)
-    search_city(search_page, city)
-
-    print(f"📥 Collecting all member links for {city}...")
-
-    collected: List[Dict] = []
-    seen_urls: Set[str] = set()
-    stable_rounds = 0
-    previous_count = 0
-    max_scroll_rounds = 600
-
-    for _ in range(max_scroll_rounds):
-        if should_stop(deadline):
-            break
-
-        try:
-            members = get_members(search_page, city)
-        except Exception as e:
-            print(f"⚠️ get_members issue in {city}: {e}")
+        # ADDRESS
+        if "Address" in text:
             try:
-                open_real_search_page(search_page)
-                search_city(search_page, city)
-                members = get_members(search_page, city)
-            except Exception as e2:
-                print(f"⚠️ Re-open search failed in {city}: {e2}")
-                break
+                data["address"] = text.split("Address")[1].split("\n")[1][:120]
+            except:
+                pass
 
-        for m in members:
-            if m["href"] not in seen_urls:
-                seen_urls.add(m["href"])
-                collected.append(m)
+        # CLASSIFICATION
+        if "Classification" in text:
+            try:
+                data["classification"] = text.split("Classification")[1].split("\n")[1]
+            except:
+                pass
 
-        print(f"👥 Total unique visible members collected so far for {city}: {len(collected)}")
-
-        if len(collected) == previous_count:
-            stable_rounds += 1
-        else:
-            stable_rounds = 0
-
-        if stable_rounds >= 3:
-            print(f"✅ Finished link collection for {city}: {len(collected)}")
-            break
-
-        previous_count = len(collected)
-        safe_scroll(search_page)
-
-    return collected
-
-
-# =========================================================
-# PROFILE EXTRACTION
-# =========================================================
-def get_lines(text: str) -> List[str]:
-    return [norm(x) for x in text.splitlines() if norm(x)]
-
-
-def get_profile_blocks(page) -> Dict:
-    script = """
-    () => {
-        const headings = ["Personal Details", "Professional Details", "My Bio", "Bio"];
-        const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-        const out = {};
-
-        for (const heading of headings) {
-            out[heading] = { text: "", links: [] };
-        }
-
-        const all = Array.from(document.querySelectorAll('*'));
-
-        for (const el of all) {
-            const txt = normalize(el.innerText);
-            if (!txt) continue;
-
-            for (const heading of headings) {
-                if (txt === normalize(heading)) {
-                    let card = el;
-                    for (let i = 0; i < 6; i++) {
-                        if (!card || !card.parentElement) break;
-                        card = card.parentElement;
-                        const cardText = (card.innerText || '').trim();
-                        if (cardText && cardText.toLowerCase().includes(heading.toLowerCase()) && cardText.length > heading.length + 20) {
-                            out[heading] = {
-                                text: cardText,
-                                links: Array.from(card.querySelectorAll('a[href]')).map(a => ({
-                                    href: a.getAttribute('href') || '',
-                                    text: (a.innerText || '').replace(/\\s+/g, ' ').trim()
-                                }))
-                            };
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        return out;
-    }
-    """
-    try:
-        return page.evaluate(script)
-    except Exception:
-        return {
-            "Personal Details": {"text": "", "links": []},
-            "Professional Details": {"text": "", "links": []},
-            "My Bio": {"text": "", "links": []},
-            "Bio": {"text": "", "links": []},
-        }
-
-
-def extract_anchor_data(card_links: List[Dict]) -> Dict:
-    data = {"emails": [], "phones": [], "websites": []}
-
-    for item in card_links:
-        href = norm(item.get("href", ""))
-        text = norm(item.get("text", ""))
-
-        if href.startswith("mailto:"):
-            val = norm(href.replace("mailto:", ""))
-            if val and val not in data["emails"]:
-                data["emails"].append(val)
-            continue
-
-        if href.startswith("tel:"):
-            val = clean_phone(href.replace("tel:", ""))
-            if val and val not in data["phones"]:
-                data["phones"].append(val)
-            continue
-
-        if href.startswith("http") and not is_bad_website(href):
-            data["websites"].append(href)
-
-        if text and "@" in text and text not in data["emails"]:
-            data["emails"].append(text)
-
-        cp = clean_phone(text)
-        if cp and cp not in data["phones"]:
-            data["phones"].append(cp)
+    except Exception as e:
+        print("⚠️ Extract error:", e)
 
     return data
 
+# ================= PROCESS CITY =================
+def process_city(page, city, progress):
+    print(f"\n🌍 {city}")
+    open_search(page)
 
-def extract_personal_details(personal_lines: List[str], personal_links: List[Dict]) -> Dict:
-    result = {
-        "Phone": "",
-        "Email": "",
-        "Website": "",
-        "Address": "",
-    }
+    page.fill("input", city)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(5000)
 
-    anchor = extract_anchor_data(personal_links)
+    seen = set()
 
-    if anchor["phones"]:
-        result["Phone"] = " / ".join(anchor["phones"][:2])
+    while True:
+        members = page.query_selector_all("a[href*='member']")
 
-    if anchor["emails"]:
-        result["Email"] = anchor["emails"][0]
+        for m in members:
+            name = m.inner_text().strip()
 
-    if anchor["websites"]:
-        result["Website"] = anchor["websites"][0]
+            if name in seen:
+                continue
+            seen.add(name)
 
-    # Fallback parse from visible lines
-    found_emails = []
-    found_phones = []
-    address_lines = []
+            try:
+                m.click()
+                page.wait_for_timeout(4000)
 
-    skip_words = {
-        "personal details", "city", "zip / postal code", "zip/postal code", "country"
-    }
+                # retry extraction
+                for i in range(2):
+                    d = extract_data(page)
+                    if d["email"] or d["phone"]:
+                        break
+                    page.wait_for_timeout(2000)
 
-    for line in personal_lines:
-        low = line.lower()
+                row = [city, name, d["phone"], d["email"], d["website"], d["address"], d["classification"]]
 
-        if low in skip_words:
-            continue
+                append_csv(row)
 
-        if not result["Email"]:
-            em = find_email(line)
-            if em and em not in found_emails:
-                found_emails.append(em)
+                push_to_sheet({
+                    "city": city,
+                    "name": name,
+                    **d
+                })
 
-        cp = clean_phone(line)
-        if cp and cp not in found_phones:
-            found_phones.append(cp)
+                print("✅", name)
 
-        if not result["Website"]:
-            if line.startswith("http") and not is_bad_website(line):
-                result["Website"] = line
+                page.go_back()
+                page.wait_for_timeout(3000)
 
-        if looks_like_address(line):
-            address_lines.append(line)
+            except Exception as e:
+                print("❌ Error:", name)
+                page.go_back()
+                page.wait_for_timeout(3000)
 
-    if not result["Email"] and found_emails:
-        result["Email"] = found_emails[0]
+        # scroll to load more
+        before = len(seen)
+        page.mouse.wheel(0, 5000)
+        page.wait_for_timeout(3000)
 
-    if not result["Phone"] and found_phones:
-        result["Phone"] = " / ".join(found_phones[:2])
+        if len(seen) == before:
+            break
 
-    if address_lines:
-        result["Address"] = ", ".join(dict.fromkeys(address_lines))
-
-    # Stronger fallback: address before City / Zip / Country labels
-    if not result["Address"]:
-        for i, line in enumerate(personal_lines):
-            if line.lower() in {"city", "zip / postal code", "zip/postal code", "country"}:
-                block = []
-                for j in range(max(0, i - 3), i):
-                    cand = personal_lines[j]
-                    if looks_like_address(cand):
-                        block.append(cand)
-                if block:
-                    result["Address"] = ", ".join(dict.fromkeys(block))
-                    break
-
-    return result
-
-
-def extract_professional_details(prof_lines: List[str], industry_line: str) -> Dict:
-    result = {
-        "Professional Classification": "",
-        "Business Description": "",
-    }
-
-    clean_prof = [x for x in prof_lines if not is_bad_text_value(x)]
-
-    if clean_prof:
-        # Usually first meaningful line = classification
-        result["Professional Classification"] = clean_prof[0]
-
-    if len(clean_prof) >= 2:
-        # Usually second meaningful line = business description
-        result["Business Description"] = clean_prof[1]
-
-    if not result["Professional Classification"] and ">" in industry_line:
-        parts = [norm(x) for x in industry_line.split(">")]
-        if parts:
-            result["Professional Classification"] = parts[-1]
-
-    return result
-
-
-def extract_profile(page, member_industry: str = "") -> Dict:
-    det = {
-        "Phone": "",
-        "Email": "",
-        "Website": "",
-        "Address": "",
-        "Professional Classification": "",
-        "Business Description": "",
-    }
-
-    try:
-        page.wait_for_load_state("networkidle", timeout=12000)
-    except Exception:
-        pass
-    page.wait_for_timeout(2000)
-
-    save_html(page, "debug_current_profile.html")
-
-    blocks = get_profile_blocks(page)
-
-    personal_text = blocks.get("Personal Details", {}).get("text", "")
-    prof_text = blocks.get("Professional Details", {}).get("text", "")
-    bio_text = blocks.get("My Bio", {}).get("text", "") or blocks.get("Bio", {}).get("text", "")
-
-    personal_lines = get_lines(personal_text)
-    prof_lines = get_lines(prof_text)
-    bio_lines = get_lines(bio_text)
-
-    personal_links = blocks.get("Personal Details", {}).get("links", [])
-
-    personal = extract_personal_details(personal_lines, personal_links)
-    prof = extract_professional_details(prof_lines, member_industry)
-
-    det["Phone"] = personal["Phone"]
-    det["Email"] = personal["Email"]
-    det["Website"] = personal["Website"]
-    det["Address"] = personal["Address"]
-    det["Professional Classification"] = prof["Professional Classification"]
-    det["Business Description"] = prof["Business Description"]
-
-    # Final fallback from full page
-    if not det["Email"]:
-        full_text = " ".join(personal_lines + prof_lines + bio_lines)
-        det["Email"] = find_email(full_text)
-
-    if not det["Business Description"] and bio_lines:
-        clean_bio = [x for x in bio_lines if not is_bad_text_value(x)]
-        if clean_bio:
-            det["Business Description"] = " ".join(clean_bio[:3])
-
-    return det
-
-
-def scrape_one_profile(profile_page, member: Dict, city: str) -> Optional[Dict]:
-    url = member["href"]
-
-    try:
-        profile_page.goto(url, wait_until="domcontentloaded", timeout=25000)
-        profile_page.wait_for_timeout(2000)
-    except Exception as e:
-        print(f"⚠️ Cannot open profile: {e}")
-        return None
-
-    prof = extract_profile(profile_page, member.get("industry", ""))
-
-    final = {
-        "Search City": city,
-        "Name": member["name"],
-        "Chapter": member["chapter"],
-        "Company": member["company"],
-        "City": member["city"],
-        "Industry and Classification": member["industry"],
-        "Profile URL": url,
-        "Phone": prof["Phone"],
-        "Email": prof["Email"],
-        "Website": prof["Website"],
-        "Address": prof["Address"],
-        "Professional Classification": prof["Professional Classification"],
-        "Business Description": prof["Business Description"],
-    }
-
-    print(f"\n➡️ {final['Name']} | {city}")
-    print(f"   Chapter        : {final['Chapter']}")
-    print(f"   Company        : {final['Company']}")
-    print(f"   Industry       : {final['Industry and Classification']}")
-    print(f"   Phone          : {final['Phone']}")
-    print(f"   Email          : {final['Email']}")
-    print(f"   Website        : {final['Website']}")
-    print(f"   Address        : {final['Address']}")
-    print(f"   Classification : {final['Professional Classification']}")
-
-    return final
-
-
-# =========================================================
-# PROCESS CITY
-# =========================================================
-def process_city(
-    search_page,
-    profile_page,
-    city: str,
-    done_urls: Set[str],
-    all_rows: List[Dict],
-    progress: Dict,
-    google_batch: List[Dict],
-    deadline: float,
-) -> bool:
-    progress["current_city"] = city
+    progress["completed_cities"].append(city)
     save_progress(progress)
 
-    if not progress.get("city_queue"):
-        queue = collect_all_links_for_city(search_page, city, deadline)
-        progress["city_queue"] = queue
-        progress["city_index"] = 0
-        save_progress(progress)
-    else:
-        queue = progress["city_queue"]
-        print(f"♻️ Resuming existing queue for {city}: total={len(queue)} start_index={progress.get('city_index', 0)}")
-
-    start_index = int(progress.get("city_index", 0))
-
-    for idx in range(start_index, len(queue)):
-        if should_stop(deadline):
-            print(f"⏳ Safe stop before timeout in city {city} at profile index {idx}")
-            flush_google_batch(google_batch)
-            google_batch.clear()
-            save_progress(progress)
-            return False
-
-        member = queue[idx]
-        url = member["href"]
-
-        progress["current_city"] = city
-        progress["city_index"] = idx
-        save_progress(progress)
-
-        if url in done_urls:
-            continue
-
-        final = scrape_one_profile(profile_page, member, city)
-        if not final:
-            continue
-
-        append_csv(final)
-        google_batch.append(final)
-        all_rows.append(final)
-
-        done_urls.add(url)
-        mark_url_done(progress, url)
-
-        if len(google_batch) >= BATCH_SIZE:
-            flush_google_batch(google_batch)
-            google_batch.clear()
-
-    flush_google_batch(google_batch)
-    google_batch.clear()
-
-    mark_city_completed(progress, city)
-    print(f"✅ City completed fully: {city}")
-    return True
-
-
-# =========================================================
-# MAIN
-# =========================================================
+# ================= MAIN =================
 def main():
     if not BNI_EMAIL or not BNI_PASSWORD:
-        raise Exception("Set BNI_EMAIL and BNI_PASSWORD first")
-
-    print("=" * 70)
-    print("BNI Connect Scraper — Personal Details Card Parser")
-    print(f"Cities    : {', '.join(BNI_CITIES)}")
-    print(f"CSV       : {CSV_FILE}")
-    print(f"Headless  : {HEADLESS}")
-    print(f"Progress  : {PROGRESS_FILE}")
-    print(f"Max run   : {MAX_RUN_MINUTES} minutes")
-    print(f"Batch size: {BATCH_SIZE}")
-    print("=" * 70)
-
-    init_csv()
-
-    progress = load_progress()
-    done_urls_from_csv = load_done_urls_from_csv()
-    done_urls_from_progress = set(progress.get("done_urls", []))
-    done_urls: Set[str] = set(done_urls_from_csv) | set(done_urls_from_progress)
-
-    all_rows: List[Dict] = []
-    google_batch: List[Dict] = []
-
-    remaining_cities = get_remaining_cities(progress, BNI_CITIES)
-
-    print(f"✅ Already completed cities: {progress.get('completed_cities', [])}")
-    print(f"▶ Remaining cities: {remaining_cities}")
-    print(f"🔁 Already saved profile URLs: {len(done_urls)}")
-
-    if not remaining_cities and not progress.get("current_city"):
-        print("🎉 All configured cities already completed.")
+        print("❌ Set env variables")
         return
 
-    deadline = make_deadline()
+    init_csv()
+    progress = load_progress()
+
+    remaining = [c for c in BNI_CITIES if c not in progress["completed_cities"]]
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO)
-        context = browser.new_context()
-        search_page = context.new_page()
-        profile_page = context.new_page()
+        browser = p.chromium.launch(headless=HEADLESS)
+        page = browser.new_page()
 
-        login(search_page)
+        login(page)
 
-        current_city = progress.get("current_city", "")
-        if current_city and current_city not in progress.get("completed_cities", []):
-            print(f"♻️ Resuming unfinished city first: {current_city}")
+        for city in remaining:
             try:
-                completed = process_city(
-                    search_page=search_page,
-                    profile_page=profile_page,
-                    city=current_city,
-                    done_urls=done_urls,
-                    all_rows=all_rows,
-                    progress=progress,
-                    google_batch=google_batch,
-                    deadline=deadline,
-                )
-                if not completed:
-                    print("⏸ Run stopped safely. Next run will continue from same city and same profile index.")
-                    return
+                process_city(page, city, progress)
             except Exception as e:
-                print(f"❌ Current city failed: {current_city} | {e}")
-                save_progress(progress)
-                flush_google_batch(google_batch)
-                google_batch.clear()
-                return
-
-        remaining_cities = get_remaining_cities(progress, BNI_CITIES)
-
-        for city in remaining_cities:
-            try:
-                progress["current_city"] = city
-                progress["city_queue"] = []
-                progress["city_index"] = 0
-                save_progress(progress)
-
-                completed = process_city(
-                    search_page=search_page,
-                    profile_page=profile_page,
-                    city=city,
-                    done_urls=done_urls,
-                    all_rows=all_rows,
-                    progress=progress,
-                    google_batch=google_batch,
-                    deadline=deadline,
-                )
-                if not completed:
-                    print(f"⏸ Run stopped safely. Next run will resume from city: {city}")
-                    break
-            except Exception as e:
-                print(f"❌ City failed: {city} | {e}")
-                save_progress(progress)
-                flush_google_batch(google_batch)
-                google_batch.clear()
+                print("❌ City fail:", city)
                 break
 
-        flush_google_batch(google_batch)
-        google_batch.clear()
-
-        print("\n" + "=" * 70)
-        print(f"🎉 DONE! New rows saved in this run: {len(all_rows)}")
-        print(f"📄 CSV: {CSV_FILE}")
-        if GOOGLE_WEBAPP_URL and GOOGLE_WEBAPP_URL != "YOUR_URL":
-            print("📤 Google Sheet posting was enabled")
-        print("=" * 70)
-
-        print("\nClosing browser...")
-        try:
-            profile_page.close()
-        except Exception:
-            pass
-        try:
-            search_page.close()
-        except Exception:
-            pass
-        context.close()
         browser.close()
 
-
+# ================= RUN =================
 if __name__ == "__main__":
     main()
