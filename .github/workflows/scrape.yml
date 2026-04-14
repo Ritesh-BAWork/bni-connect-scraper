@@ -86,7 +86,7 @@ jobs:
         if: steps.previous_run.outputs.run_id != ''
         uses: actions/download-artifact@v5
         with:
-          name: bni-progress
+          name: bni-progress-v8
           path: .
           github-token: ${{ github.token }}
           run-id: ${{ steps.previous_run.outputs.run_id }}
@@ -95,15 +95,15 @@ jobs:
         run: |
           echo "Workspace files:"
           ls -la
-          if [ -f progress_state.json ]; then
-            echo "progress_state.json restored"
+          if [ -f progress_state_v8.json ]; then
+            echo "progress_state_v8.json restored"
           else
-            echo "No previous progress_state.json found"
+            echo "No previous progress_state_v8.json found"
           fi
-          if [ -f bni_members.csv ]; then
-            echo "bni_members.csv restored"
+          if [ -f bni_members_v8.csv ]; then
+            echo "bni_members_v8.csv restored"
           else
-            echo "No previous bni_members.csv found"
+            echo "No previous bni_members_v8.csv found"
           fi
 
       - name: Run scraper
@@ -115,11 +115,11 @@ jobs:
           HEADLESS: "true"
           SLOW_MO: "0"
           DEBUG_HTML: "false"
-          CSV_FILE: "bni_members_v2.csv"
-          PROGRESS_FILE: "progress_state_v2.json"
+          CSV_FILE: "bni_members_v8.csv"
+          PROGRESS_FILE: "progress_state_v8.json"
           MAX_RUN_MINUTES: "330"
           SAFE_EXIT_BUFFER_SECONDS: "300"
-          BATCH_SIZE: "50"
+          BATCH_SIZE: "25"
         run: |
           python scraper.py
 
@@ -127,10 +127,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bni-progress
+          name: bni-progress-v8
           path: |
-            progress_state.json
-            bni_members.csv
+            progress_state_v8.json
+            bni_members_v8.csv
           if-no-files-found: warn
           overwrite: true
 
@@ -138,7 +138,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bni-members-csv
-          path: bni_members.csv
+          name: bni-members-csv-v8
+          path: bni_members_v8.csv
           if-no-files-found: warn
           overwrite: true
