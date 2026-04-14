@@ -82,14 +82,15 @@ jobs:
           print(f"Previous successful run id: {run_id or 'none'}")
           PY
 
-      - name: Restore previous progress artifact
-        if: steps.previous_run.outputs.run_id != ''
-        uses: actions/download-artifact@v5
-        with:
-          name: bni-progress-v8
-          path: .
-          github-token: ${{ github.token }}
-          run-id: ${{ steps.previous_run.outputs.run_id }}
+      -- name: Restore previous progress artifact
+  continue-on-error: true
+  if: steps.previous_run.outputs.run_id != ''
+  uses: actions/download-artifact@v5
+  with:
+    name: bni-progress-v8
+    path: .
+    github-token: ${{ github.token }}
+    run-id: ${{ steps.previous_run.outputs.run_id }}
 
       - name: Show restored files
         run: |
