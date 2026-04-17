@@ -17,7 +17,6 @@ BNI_PASSWORD = os.getenv("BNI_PASSWORD", "").strip()
 BNI_CITIES = [c.strip() for c in os.getenv("BNI_CITIES", "Nagpur").split(",") if c.strip()]
 
 LOGIN_URL = "https://www.bniconnectglobal.com/login/"
-DASHBOARD_URL = "https://www.bniconnectglobal.com/web/dashboard"
 SEARCH_URL = "https://www.bniconnectglobal.com/web/dashboard/search"
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
@@ -29,7 +28,7 @@ DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
 
 MAX_RUN_MINUTES = int(os.getenv("MAX_RUN_MINUTES", "330"))
 SAFE_EXIT_BUFFER_SECONDS = int(os.getenv("SAFE_EXIT_BUFFER_SECONDS", "300"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
 
 
 # =========================================================
@@ -77,17 +76,6 @@ def should_stop(deadline: float) -> bool:
     return time.time() >= (deadline - SAFE_EXIT_BUFFER_SECONDS)
 
 
-def save_html(page, filename: str) -> None:
-    if not DEBUG_HTML:
-        return
-    try:
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(page.content())
-        print(f"💾 Saved HTML: {filename}")
-    except Exception as e:
-        print(f"⚠️ Could not save HTML {filename}: {e}")
-
-
 def is_bad_website(url: str) -> bool:
     low = (url or "").lower()
     bad = [
@@ -103,18 +91,25 @@ def is_bad_website(url: str) -> bool:
 def looks_like_address(text: str) -> bool:
     if not text:
         return False
-
     text = text.lower()
-
     keywords = [
-        "road", "street", "lane", "nagar", "colony",
-        "plot", "floor", "building", "apartment",
-        "complex", "near", "opp", "city", "area",
-        "block", "sector", "phase", "marg", "chowk",
-        "society", "west", "east", "north", "south"
+        "road", "street", "lane", "nagar", "colony", "plot", "floor",
+        "building", "apartment", "complex", "near", "opp", "city",
+        "area", "block", "sector", "phase", "marg", "chowk", "society",
+        "west", "east", "north", "south"
     ]
-
     return any(word in text for word in keywords)
+
+
+def save_html(page, filename: str) -> None:
+    if not DEBUG_HTML:
+        return
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(page.content())
+        print(f"💾 Saved HTML: {filename}")
+    except Exception as e:
+        print(f"⚠️ Could not save HTML {filename}: {e}")
 
 
 # =========================================================
@@ -122,11 +117,11 @@ def looks_like_address(text: str) -> bool:
 # =========================================================
 def init_csv() -> None:
     if os.path.exists(CSV_FILE):
-        print(f"📄 CSV exists: {CSV_FILE}")
+        print(f"📄 CSV ready: {CSV_FILE}")
         return
     with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow(HEADERS)
-    print(f"📄 CSV ready: {CSV_FILE}")
+    print(f"📄 CSV created: {CSV_FILE}")
 
 
 def append_csv(row: Dict) -> None:
@@ -304,7 +299,7 @@ def login(page) -> None:
 
 
 # =========================================================
-# SEARCH / MEMBER COLLECTION
+# SEARCH / COLLECT ALL LINKS FOR ONE CITY
 # =========================================================
 def open_search(page) -> None:
     page.goto(SEARCH_URL, wait_until="domcontentloaded")
@@ -341,11 +336,13 @@ def search_city(page, city: str) -> None:
     page.wait_for_timeout(5000)
 
 
-def get_members(page, city: str) -> List[Dict]:
+def get_visible_members(page, city: str) -> List[Dict]:
     js = """
     (searchCity) => {
         const members = [];
-        const anchors = Array.from(document.querySelectorAll('a[href*="networkHome?userId"], a[href*="/web/member?uuId="], a[href*="/web/member?uuid="]'));
+        const anchors = Array.from(
+            document.querySelectorAll('a[href*="networkHome?userId"], a[href*="/web/member?uuId="], a[href*="/web/member?uuid="]')
+        );
 
         for (const a of anchors) {
             const name = (a.innerText || '').replace(/\\s+/g, ' ').trim();
@@ -356,11 +353,7 @@ def get_members(page, city: str) -> List[Dict]:
             const row = a.closest('div');
             const rowText = row ? (row.innerText || '').replace(/\\s+/g, ' ').trim() : '';
 
-            members.push({
-                name,
-                href,
-                rowText
-            });
+            members.push({ name, href, rowText });
         }
 
         const seen = new Set();
@@ -384,7 +377,6 @@ def get_members(page, city: str) -> List[Dict]:
             continue
 
         chapter = ""
-        company = ""
         industry = ""
 
         parts = [x.strip() for x in row_text.split("  ") if x.strip()]
@@ -398,7 +390,7 @@ def get_members(page, city: str) -> List[Dict]:
             "name": name,
             "href": href,
             "chapter": chapter,
-            "company": company,
+            "company": "",
             "city": city,
             "industry": industry,
         })
@@ -406,14 +398,36 @@ def get_members(page, city: str) -> List[Dict]:
     return out
 
 
-def safe_scroll(page) -> None:
+def deep_scroll_search_results(page) -> None:
+    # main window scroll
     try:
         page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1500)
     except Exception:
         pass
+
+    # mouse wheel
     try:
-        page.mouse.wheel(0, 4000)
+        page.mouse.wheel(0, 5000)
+        page.wait_for_timeout(1500)
+    except Exception:
+        pass
+
+    # scroll every scrollable div
+    try:
+        page.evaluate(
+            """
+            () => {
+                const els = Array.from(document.querySelectorAll('div'));
+                for (const el of els) {
+                    const s = window.getComputedStyle(el);
+                    if ((s.overflowY === 'auto' || s.overflowY === 'scroll') && el.scrollHeight > el.clientHeight) {
+                        el.scrollTop = el.scrollHeight;
+                    }
+                }
+            }
+            """
+        )
         page.wait_for_timeout(1500)
     except Exception:
         pass
@@ -423,38 +437,42 @@ def collect_all_links_for_city(page, city: str, deadline: float) -> List[Dict]:
     open_search(page)
     search_city(page, city)
 
+    print(f"📥 Collecting all links for city: {city}")
+
     collected: List[Dict] = []
     seen_urls: Set[str] = set()
-    stable_rounds = 0
     previous_count = 0
+    stable_rounds = 0
 
-    for _ in range(300):
+    # repeat until no new members appear after multiple scrolls
+    for round_no in range(1, 401):
         if should_stop(deadline):
             break
 
         try:
-            members = get_members(page, city)
+            visible = get_visible_members(page, city)
         except Exception as e:
-            print(f"⚠️ get_members failed in {city}: {e}")
+            print(f"⚠️ get_visible_members failed in {city}: {e}")
             break
 
-        for m in members:
+        for m in visible:
             if m["href"] not in seen_urls:
                 seen_urls.add(m["href"])
                 collected.append(m)
 
-        print(f"👥 {city} members collected so far: {len(collected)}")
+        print(f"👥 {city} members collected so far: {len(collected)} | round={round_no}")
 
         if len(collected) == previous_count:
             stable_rounds += 1
         else:
             stable_rounds = 0
 
-        if stable_rounds >= 3:
+        if stable_rounds >= 5:
+            print(f"✅ Link collection finished for {city}: total={len(collected)}")
             break
 
         previous_count = len(collected)
-        safe_scroll(page)
+        deep_scroll_search_results(page)
 
     return collected
 
@@ -478,7 +496,6 @@ def extract_profile(page, member_industry: str = "") -> Dict:
         pass
     page.wait_for_timeout(2500)
 
-    # 1) Direct links first
     try:
         links = page.locator("a[href]")
         count = links.count()
@@ -494,17 +511,15 @@ def extract_profile(page, member_industry: str = "") -> Dict:
                 p = clean_phone(href.replace("tel:", ""))
                 if p and p not in phones:
                     phones.append(p)
-
             elif href.startswith("mailto:"):
                 e = norm(href.replace("mailto:", ""))
                 if e and e not in emails:
                     emails.append(e)
-
             elif href.startswith("http") and not is_bad_website(href):
                 if href not in websites:
                     websites.append(href)
 
-            if not emails and "@" in txt:
+            if "@" in txt and txt not in emails:
                 emails.append(txt)
 
             cp = clean_phone(txt)
@@ -520,7 +535,6 @@ def extract_profile(page, member_industry: str = "") -> Dict:
     except Exception:
         pass
 
-    # 2) Full text fallback
     try:
         text = page.inner_text("body")
     except Exception:
@@ -550,12 +564,11 @@ def extract_profile(page, member_industry: str = "") -> Dict:
                 result["Website"] = s
                 break
 
-    # Address: gather lines before city/zip/country
     if not result["Address"]:
         for i, line in enumerate(lines):
             if line.lower() in {"city", "zip / postal code", "zip/postal code", "country"}:
                 addr_block = []
-                for j in range(max(0, i - 3), i):
+                for j in range(max(0, i - 4), i):
                     cand = lines[j]
                     if looks_like_address(cand):
                         addr_block.append(cand)
@@ -569,13 +582,11 @@ def extract_profile(page, member_industry: str = "") -> Dict:
                 result["Address"] = line
                 break
 
-    # Classification
     if ">" in member_industry:
         parts = [norm(x) for x in member_industry.split(">")]
         if parts:
             result["Professional Classification"] = parts[-1]
 
-    # Business description fallback
     if not result["Business Description"]:
         for i, line in enumerate(lines):
             if line.lower() in {"professional details", "my bio", "bio"}:
@@ -603,7 +614,6 @@ def scrape_one_profile(profile_page, member: Dict, city: str) -> Optional[Dict]:
         print(f"⚠️ Cannot open profile: {e}")
         return None
 
-    # retry extraction once if blank
     prof = extract_profile(profile_page, member.get("industry", ""))
     if not prof["Phone"] and not prof["Email"]:
         profile_page.wait_for_timeout(2000)
@@ -636,12 +646,13 @@ def scrape_one_profile(profile_page, member: Dict, city: str) -> Optional[Dict]:
 
 
 # =========================================================
-# PROCESS CITY
+# PROCESS ONE CITY FULLY
 # =========================================================
 def process_city(search_page, profile_page, city: str, done_urls: Set[str], progress: Dict, deadline: float) -> bool:
     progress["current_city"] = city
     save_progress(progress)
 
+    # collect full queue for this city first
     if not progress.get("city_queue"):
         queue = collect_all_links_for_city(search_page, city, deadline)
         if not queue:
@@ -653,6 +664,8 @@ def process_city(search_page, profile_page, city: str, done_urls: Set[str], prog
     else:
         queue = progress["city_queue"]
         print(f"♻️ Resuming queue for {city}: total={len(queue)} from={progress.get('city_index', 0)}")
+
+    print(f"📌 Starting scrape for full city: {city} | total profiles in queue={len(queue)}")
 
     batch_rows: List[Dict] = []
     start_index = int(progress.get("city_index", 0))
@@ -697,7 +710,7 @@ def process_city(search_page, profile_page, city: str, done_urls: Set[str], prog
         return False
 
     mark_city_completed(progress, city)
-    print(f"✅ City completed: {city} | scraped={scraped_count}")
+    print(f"✅ Full city completed: {city} | scraped={scraped_count}")
     return True
 
 
@@ -712,8 +725,6 @@ def main():
     progress = load_progress()
 
     done_urls = load_done_urls_from_csv() | set(progress.get("done_urls", []))
-    remaining_cities = get_remaining_cities(progress)
-
     deadline = make_deadline()
 
     with sync_playwright() as p:
@@ -724,6 +735,7 @@ def main():
 
         login(search_page)
 
+        # unfinished city first
         current_city = progress.get("current_city", "")
         if current_city and current_city not in progress.get("completed_cities", []):
             ok = process_city(search_page, profile_page, current_city, done_urls, progress, deadline)
@@ -731,6 +743,7 @@ def main():
                 browser.close()
                 return
 
+        # next cities one by one
         remaining_cities = get_remaining_cities(progress)
 
         for city in remaining_cities:
