@@ -100,6 +100,23 @@ def is_bad_website(url: str) -> bool:
     return any(x in low for x in bad)
 
 
+def looks_like_address(text: str) -> bool:
+    if not text:
+        return False
+
+    text = text.lower()
+
+    keywords = [
+        "road", "street", "lane", "nagar", "colony",
+        "plot", "floor", "building", "apartment",
+        "complex", "near", "opp", "city", "area",
+        "block", "sector", "phase", "marg", "chowk",
+        "society", "west", "east", "north", "south"
+    ]
+
+    return any(word in text for word in keywords)
+
+
 # =========================================================
 # CSV
 # =========================================================
