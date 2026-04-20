@@ -1,9 +1,8 @@
 import csv
-import json
 import os
 import re
 import time
-from typing import Dict, List, Set, Optional
+from typing import Dict, List
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -14,21 +13,19 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # =========================================================
 BNI_EMAIL = os.getenv("BNI_EMAIL", "").strip()
 BNI_PASSWORD = os.getenv("BNI_PASSWORD", "").strip()
-BNI_CITIES = [c.strip() for c in os.getenv("BNI_CITIES", "Nagpur").split(",") if c.strip()]
+
+CITY_TO_SCRAPE = "Mumbai"
 
 LOGIN_URL = "https://www.bniconnectglobal.com/login/"
 SEARCH_URL = "https://www.bniconnectglobal.com/web/dashboard/search"
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 SLOW_MO = int(os.getenv("SLOW_MO", "0"))
-CSV_FILE = os.getenv("CSV_FILE", "bni_members.csv")
-PROGRESS_FILE = os.getenv("PROGRESS_FILE", "progress_state.json")
+CSV_FILE = os.getenv("CSV_FILE", "mumbai_bni_members.csv")
 GOOGLE_WEBAPP_URL = os.getenv("GOOGLE_WEBAPP_URL", "").strip()
 DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
 
-MAX_RUN_MINUTES = int(os.getenv("MAX_RUN_MINUTES", "330"))
-SAFE_EXIT_BUFFER_SECONDS = int(os.getenv("SAFE_EXIT_BUFFER_SECONDS", "300"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
 
 
 # =========================================================
@@ -68,26 +65,6 @@ def find_email(t: str) -> str:
     return m.group(0) if m else ""
 
 
-def make_deadline() -> float:
-    return time.time() + (MAX_RUN_MINUTES * 60)
-
-
-def should_stop(deadline: float) -> bool:
-    return time.time() >= (deadline - SAFE_EXIT_BUFFER_SECONDS)
-
-
-def is_bad_website(url: str) -> bool:
-    low = (url or "").lower()
-    bad = [
-        "bniconnectglobal.com",
-        "facebook.com/share",
-        "wa.me/share",
-        "instagram.com/share",
-        "linkedin.com/share",
-    ]
-    return any(x in low for x in bad)
-
-
 def looks_like_address(text: str) -> bool:
     if not text:
         return False
@@ -101,100 +78,42 @@ def looks_like_address(text: str) -> bool:
     return any(word in text for word in keywords)
 
 
+def is_bad_website(url: str) -> bool:
+    low = (url or "").lower()
+    bad = [
+        "bniconnectglobal.com",
+        "facebook.com/share",
+        "wa.me/share",
+        "instagram.com/share",
+        "linkedin.com/share",
+        "bnitos.com",
+    ]
+    return any(x in low for x in bad)
+
+
 def save_html(page, filename: str) -> None:
     if not DEBUG_HTML:
         return
     try:
         with open(filename, "w", encoding="utf-8") as f:
             f.write(page.content())
-        print(f"💾 Saved HTML: {filename}")
+        print(f"Saved HTML: {filename}")
     except Exception as e:
-        print(f"⚠️ Could not save HTML {filename}: {e}")
+        print(f"Could not save HTML {filename}: {e}")
 
 
 # =========================================================
 # CSV
 # =========================================================
 def init_csv() -> None:
-    if os.path.exists(CSV_FILE):
-        print(f"📄 CSV ready: {CSV_FILE}")
-        return
     with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow(HEADERS)
-    print(f"📄 CSV created: {CSV_FILE}")
+    print(f"CSV ready: {CSV_FILE}")
 
 
 def append_csv(row: Dict) -> None:
     with open(CSV_FILE, "a", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow([row.get(h, "") for h in HEADERS])
-
-
-def load_done_urls_from_csv() -> Set[str]:
-    done = set()
-    if not os.path.exists(CSV_FILE):
-        return done
-    try:
-        with open(CSV_FILE, "r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                url = norm(row.get("Profile URL", ""))
-                if url:
-                    done.add(url)
-    except Exception as e:
-        print(f"⚠️ CSV resume read error: {e}")
-    return done
-
-
-# =========================================================
-# PROGRESS
-# =========================================================
-def default_progress() -> Dict:
-    return {
-        "completed_cities": [],
-        "done_urls": [],
-        "current_city": "",
-        "city_queue": [],
-        "city_index": 0,
-        "last_saved_at": "",
-    }
-
-
-def load_progress() -> Dict:
-    if not os.path.exists(PROGRESS_FILE):
-        return default_progress()
-    try:
-        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        base = default_progress()
-        base.update(data)
-        return base
-    except Exception:
-        return default_progress()
-
-
-def save_progress(progress: Dict) -> None:
-    progress["last_saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-        json.dump(progress, f, indent=2, ensure_ascii=False)
-
-
-def mark_url_done(progress: Dict, url: str) -> None:
-    if url and url not in progress["done_urls"]:
-        progress["done_urls"].append(url)
-
-
-def mark_city_completed(progress: Dict, city: str) -> None:
-    if city not in progress["completed_cities"]:
-        progress["completed_cities"].append(city)
-    progress["current_city"] = ""
-    progress["city_queue"] = []
-    progress["city_index"] = 0
-    save_progress(progress)
-
-
-def get_remaining_cities(progress: Dict) -> List[str]:
-    completed = set(progress.get("completed_cities", []))
-    return [c for c in BNI_CITIES if c not in completed]
 
 
 # =========================================================
@@ -205,7 +124,7 @@ def flush_google_batch(rows: List[Dict]) -> None:
         return
 
     if not GOOGLE_WEBAPP_URL or GOOGLE_WEBAPP_URL == "YOUR_URL":
-        print("ℹ️ GOOGLE_WEBAPP_URL not set. Skipping Google Sheet upload.")
+        print("GOOGLE_WEBAPP_URL not set. Skipping Google Sheet upload.")
         return
 
     payload = {"rows": rows}
@@ -213,21 +132,21 @@ def flush_google_batch(rows: List[Dict]) -> None:
     for attempt in range(1, 4):
         try:
             r = requests.post(GOOGLE_WEBAPP_URL, json=payload, timeout=60)
-            print(f"📤 Apps Script POST: {r.status_code} | batch={len(rows)}")
+            print(f"Apps Script POST: {r.status_code} | batch={len(rows)}")
             if r.ok:
                 return
-            print(f"📤 Response: {r.text[:200]}")
+            print(f"Response: {r.text[:200]}")
         except Exception as e:
-            print(f"⚠️ Google Sheet POST failed attempt {attempt}: {e}")
+            print(f"POST failed attempt {attempt}: {e}")
         time.sleep(2)
 
-    print("❌ Failed to post rows to Google Sheet")
+    print("Failed to post rows to Google Sheet")
 
 
 # =========================================================
 # PLAYWRIGHT HELPERS
 # =========================================================
-def click_first_visible(page, selectors: List[str], timeout_ms: int = 3000) -> bool:
+def click_first_visible(page, selectors, timeout_ms=3000):
     for sel in selectors:
         try:
             loc = page.locator(sel)
@@ -245,7 +164,7 @@ def click_first_visible(page, selectors: List[str], timeout_ms: int = 3000) -> b
     return False
 
 
-def fill_first_visible(page, selectors: List[str], value: str, press_enter: bool = False) -> bool:
+def fill_first_visible(page, selectors, value, press_enter=False):
     for sel in selectors:
         try:
             loc = page.locator(sel)
@@ -275,9 +194,9 @@ def fill_first_visible(page, selectors: List[str], value: str, press_enter: bool
 # LOGIN
 # =========================================================
 def login(page) -> None:
-    print("🔐 Login...")
+    print("Login...")
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(2500)
+    page.wait_for_timeout(3000)
 
     if not fill_first_visible(page, ['input[name="username"]', 'input[type="email"]'], BNI_EMAIL):
         raise Exception("Username field not found")
@@ -285,7 +204,11 @@ def login(page) -> None:
     if not fill_first_visible(page, ['input[name="password"]', 'input[type="password"]'], BNI_PASSWORD):
         raise Exception("Password field not found")
 
-    if not click_first_visible(page, ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Sign In")', 'button:has-text("Login")'], 5000):
+    if not click_first_visible(
+        page,
+        ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Sign In")', 'button:has-text("Login")'],
+        5000
+    ):
         raise Exception("Login button not found")
 
     try:
@@ -295,19 +218,20 @@ def login(page) -> None:
         raise Exception(f"Login failed. Current URL: {page.url}")
 
     page.wait_for_timeout(3000)
-    print("✅ Login done")
+    print("Login done")
 
 
 # =========================================================
-# SEARCH / COLLECT ALL LINKS FOR ONE CITY
+# SEARCH / COLLECT ALL MUMBAI LINKS
 # =========================================================
 def open_search(page) -> None:
     page.goto(SEARCH_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(4000)
+    page.wait_for_timeout(5000)
 
 
 def search_city(page, city: str) -> None:
-    print(f"🌍 {city}")
+    print(f"Searching city: {city}")
+
     if not fill_first_visible(
         page,
         [
@@ -338,7 +262,7 @@ def search_city(page, city: str) -> None:
 
 def get_visible_members(page, city: str) -> List[Dict]:
     js = """
-    (searchCity) => {
+    () => {
         const members = [];
         const anchors = Array.from(
             document.querySelectorAll('a[href*="networkHome?userId"], a[href*="/web/member?uuId="], a[href*="/web/member?uuid="]')
@@ -365,7 +289,7 @@ def get_visible_members(page, city: str) -> List[Dict]:
         });
     }
     """
-    raw = page.evaluate(js, city)
+    raw = page.evaluate(js)
 
     out = []
     for r in raw:
@@ -399,21 +323,18 @@ def get_visible_members(page, city: str) -> List[Dict]:
 
 
 def deep_scroll_search_results(page) -> None:
-    # main window scroll
     try:
         page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1500)
     except Exception:
         pass
 
-    # mouse wheel
     try:
         page.mouse.wheel(0, 5000)
         page.wait_for_timeout(1500)
     except Exception:
         pass
 
-    # scroll every scrollable div
     try:
         page.evaluate(
             """
@@ -433,34 +354,26 @@ def deep_scroll_search_results(page) -> None:
         pass
 
 
-def collect_all_links_for_city(page, city: str, deadline: float) -> List[Dict]:
+def collect_all_links_for_city(page, city: str) -> List[Dict]:
     open_search(page)
     search_city(page, city)
 
-    print(f"📥 Collecting all links for city: {city}")
+    print(f"Collecting all links for city: {city}")
 
     collected: List[Dict] = []
-    seen_urls: Set[str] = set()
+    seen_urls = set()
     previous_count = 0
     stable_rounds = 0
 
-    # repeat until no new members appear after multiple scrolls
     for round_no in range(1, 401):
-        if should_stop(deadline):
-            break
-
-        try:
-            visible = get_visible_members(page, city)
-        except Exception as e:
-            print(f"⚠️ get_visible_members failed in {city}: {e}")
-            break
+        visible = get_visible_members(page, city)
 
         for m in visible:
             if m["href"] not in seen_urls:
                 seen_urls.add(m["href"])
                 collected.append(m)
 
-        print(f"👥 {city} members collected so far: {len(collected)} | round={round_no}")
+        print(f"{city} members collected so far: {len(collected)} | round={round_no}")
 
         if len(collected) == previous_count:
             stable_rounds += 1
@@ -468,7 +381,7 @@ def collect_all_links_for_city(page, city: str, deadline: float) -> List[Dict]:
             stable_rounds = 0
 
         if stable_rounds >= 5:
-            print(f"✅ Link collection finished for {city}: total={len(collected)}")
+            print(f"Link collection finished for {city}: total={len(collected)}")
             break
 
         previous_count = len(collected)
@@ -480,6 +393,26 @@ def collect_all_links_for_city(page, city: str, deadline: float) -> List[Dict]:
 # =========================================================
 # PROFILE EXTRACTION
 # =========================================================
+def extract_industry_from_profile(page) -> str:
+    try:
+        text = page.inner_text("body")
+        lines = [norm(l) for l in text.splitlines() if norm(l)]
+
+        for i, line in enumerate(lines):
+            if line.lower() in ["professional details", "business category", "classification"]:
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    if ">" in lines[j]:
+                        return lines[j]
+
+        for line in lines:
+            if ">" in line:
+                return line
+    except Exception:
+        pass
+
+    return ""
+
+
 def extract_profile(page, member_industry: str = "") -> Dict:
     result = {
         "Phone": "",
@@ -611,7 +544,7 @@ def scrape_one_profile(profile_page, member: Dict, city: str) -> Optional[Dict]:
         profile_page.goto(url, wait_until="domcontentloaded", timeout=25000)
         profile_page.wait_for_timeout(2000)
     except Exception as e:
-        print(f"⚠️ Cannot open profile: {e}")
+        print(f"Cannot open profile: {e}")
         return None
 
     prof = extract_profile(profile_page, member.get("industry", ""))
@@ -619,13 +552,19 @@ def scrape_one_profile(profile_page, member: Dict, city: str) -> Optional[Dict]:
         profile_page.wait_for_timeout(2000)
         prof = extract_profile(profile_page, member.get("industry", ""))
 
+    industry_final = member.get("industry", "")
+    if not industry_final or ">" not in industry_final:
+        profile_industry = extract_industry_from_profile(profile_page)
+        if profile_industry:
+            industry_final = profile_industry
+
     final = {
         "Search City": city,
         "Name": member["name"],
         "Chapter": member["chapter"],
         "Company": member["company"],
         "City": member["city"],
-        "Industry and Classification": member["industry"],
+        "Industry and Classification": industry_final,
         "Profile URL": url,
         "Phone": prof["Phone"],
         "Email": prof["Email"],
@@ -635,83 +574,15 @@ def scrape_one_profile(profile_page, member: Dict, city: str) -> Optional[Dict]:
         "Business Description": prof["Business Description"],
     }
 
-    print(f"✅ {final['Name']} | {city}")
-    print(f"   Phone: {final['Phone']}")
-    print(f"   Email: {final['Email']}")
-    print(f"   Website: {final['Website']}")
-    print(f"   Address: {final['Address']}")
-    print(f"   Classification: {final['Professional Classification']}")
+    print(f"Done: {final['Name']} | {city}")
+    print(f"Phone: {final['Phone']}")
+    print(f"Email: {final['Email']}")
+    print(f"Website: {final['Website']}")
+    print(f"Address: {final['Address']}")
+    print(f"Classification: {final['Professional Classification']}")
+    print(f"Industry: {final['Industry and Classification']}")
 
     return final
-
-
-# =========================================================
-# PROCESS ONE CITY FULLY
-# =========================================================
-def process_city(search_page, profile_page, city: str, done_urls: Set[str], progress: Dict, deadline: float) -> bool:
-    progress["current_city"] = city
-    save_progress(progress)
-
-    # collect full queue for this city first
-    if not progress.get("city_queue"):
-        queue = collect_all_links_for_city(search_page, city, deadline)
-        if not queue:
-            print(f"⚠️ No members found for city: {city}")
-            return False
-        progress["city_queue"] = queue
-        progress["city_index"] = 0
-        save_progress(progress)
-    else:
-        queue = progress["city_queue"]
-        print(f"♻️ Resuming queue for {city}: total={len(queue)} from={progress.get('city_index', 0)}")
-
-    print(f"📌 Starting scrape for full city: {city} | total profiles in queue={len(queue)}")
-
-    batch_rows: List[Dict] = []
-    start_index = int(progress.get("city_index", 0))
-    scraped_count = 0
-
-    for idx in range(start_index, len(queue)):
-        if should_stop(deadline):
-            print(f"⏳ Safe stop before timeout in {city} at index {idx}")
-            flush_google_batch(batch_rows)
-            save_progress(progress)
-            return False
-
-        member = queue[idx]
-        url = member["href"]
-
-        progress["current_city"] = city
-        progress["city_index"] = idx
-        save_progress(progress)
-
-        if url in done_urls:
-            continue
-
-        final = scrape_one_profile(profile_page, member, city)
-        if not final:
-            continue
-
-        append_csv(final)
-        batch_rows.append(final)
-
-        done_urls.add(url)
-        mark_url_done(progress, url)
-        scraped_count += 1
-
-        if len(batch_rows) >= BATCH_SIZE:
-            flush_google_batch(batch_rows)
-            batch_rows = []
-
-    flush_google_batch(batch_rows)
-
-    if scraped_count == 0 and start_index == 0:
-        print(f"⚠️ City {city} had zero scraped profiles. Not marking complete.")
-        return False
-
-    mark_city_completed(progress, city)
-    print(f"✅ Full city completed: {city} | scraped={scraped_count}")
-    return True
 
 
 # =========================================================
@@ -722,10 +593,6 @@ def main():
         raise Exception("Missing BNI_EMAIL or BNI_PASSWORD")
 
     init_csv()
-    progress = load_progress()
-
-    done_urls = load_done_urls_from_csv() | set(progress.get("done_urls", []))
-    deadline = make_deadline()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO)
@@ -735,26 +602,25 @@ def main():
 
         login(search_page)
 
-        # unfinished city first
-        current_city = progress.get("current_city", "")
-        if current_city and current_city not in progress.get("completed_cities", []):
-            ok = process_city(search_page, profile_page, current_city, done_urls, progress, deadline)
-            if not ok:
-                browser.close()
-                return
+        members = collect_all_links_for_city(search_page, CITY_TO_SCRAPE)
+        print(f"Starting full scrape for {CITY_TO_SCRAPE}. Total profiles found: {len(members)}")
 
-        # next cities one by one
-        remaining_cities = get_remaining_cities(progress)
+        batch_rows: List[Dict] = []
 
-        for city in remaining_cities:
-            progress["current_city"] = city
-            progress["city_queue"] = []
-            progress["city_index"] = 0
-            save_progress(progress)
+        for idx, member in enumerate(members, start=1):
+            print(f"Profile {idx}/{len(members)}")
+            final = scrape_one_profile(profile_page, member, CITY_TO_SCRAPE)
+            if not final:
+                continue
 
-            ok = process_city(search_page, profile_page, city, done_urls, progress, deadline)
-            if not ok:
-                break
+            append_csv(final)
+            batch_rows.append(final)
+
+            if len(batch_rows) >= BATCH_SIZE:
+                flush_google_batch(batch_rows)
+                batch_rows = []
+
+        flush_google_batch(batch_rows)
 
         try:
             profile_page.close()
