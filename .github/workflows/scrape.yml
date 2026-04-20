@@ -1,9 +1,7 @@
-name: BNI Scraper
+name: BNI Scraper Mumbai
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "30 2 * * *"
 
 permissions:
   contents: read
@@ -32,50 +30,24 @@ jobs:
         run: |
           python -m playwright install --with-deps chromium
 
-      # ❌ DISABLED restore (VERY IMPORTANT)
-      # Commented intentionally to force fresh run
-
-      # - name: Find previous successful run id
-      # - name: Restore previous progress artifact
-
-      - name: Run scraper (FRESH RUN)
+      - name: Run scraper
         env:
           BNI_EMAIL: ${{ secrets.BNI_EMAIL }}
           BNI_PASSWORD: ${{ secrets.BNI_PASSWORD }}
-          BNI_CITIES: ${{ secrets.BNI_CITIES }}
           GOOGLE_WEBAPP_URL: ${{ secrets.GOOGLE_WEBAPP_URL }}
-
           HEADLESS: "true"
           SLOW_MO: "0"
           DEBUG_HTML: "false"
-
-          # 🔥 NEW FILE NAMES (NO OLD DATA)
-          CSV_FILE: "bni_members_v9.csv"
-          PROGRESS_FILE: "progress_state_v9.json"
-
-          MAX_RUN_MINUTES: "330"
-          SAFE_EXIT_BUFFER_SECONDS: "300"
-          BATCH_SIZE: "20"
-
+          CSV_FILE: "mumbai_bni_members.csv"
+          BATCH_SIZE: "10"
         run: |
           python scraper.py
-
-      - name: Upload progress artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bni-progress-v9
-          path: |
-            progress_state_v9.json
-            bni_members_v9.csv
-          if-no-files-found: warn
-          overwrite: true
 
       - name: Upload CSV artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bni-members-csv-v9
-          path: bni_members_v9.csv
+          name: mumbai-bni-members-csv
+          path: mumbai_bni_members.csv
           if-no-files-found: warn
           overwrite: true
