@@ -8,9 +8,7 @@ import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
-# =========================================================
-# CONFIG
-# =========================================================
+# ================= CONFIG =================
 BNI_EMAIL = os.getenv("BNI_EMAIL", "").strip()
 BNI_PASSWORD = os.getenv("BNI_PASSWORD", "").strip()
 
@@ -24,13 +22,10 @@ SLOW_MO = int(os.getenv("SLOW_MO", "0"))
 CSV_FILE = os.getenv("CSV_FILE", "mumbai_bni_members.csv")
 GOOGLE_WEBAPP_URL = os.getenv("GOOGLE_WEBAPP_URL", "").strip()
 DEBUG_HTML = os.getenv("DEBUG_HTML", "false").lower() == "true"
-
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
 
 
-# =========================================================
-# HEADERS
-# =========================================================
+# ================= HEADERS =================
 HEADERS = [
     "Search City",
     "Name",
@@ -48,9 +43,7 @@ HEADERS = [
 ]
 
 
-# =========================================================
-# HELPERS
-# =========================================================
+# ================= HELPERS =================
 def norm(t: str) -> str:
     return re.sub(r"\s+", " ", t or "").strip()
 
@@ -65,32 +58,6 @@ def find_email(t: str) -> str:
     return m.group(0) if m else ""
 
 
-def looks_like_address(text: str) -> bool:
-    if not text:
-        return False
-    text = text.lower()
-    keywords = [
-        "road", "street", "lane", "nagar", "colony", "plot", "floor",
-        "building", "apartment", "complex", "near", "opp", "city",
-        "area", "block", "sector", "phase", "marg", "chowk", "society",
-        "west", "east", "north", "south"
-    ]
-    return any(word in text for word in keywords)
-
-
-def is_bad_website(url: str) -> bool:
-    low = (url or "").lower()
-    bad = [
-        "bniconnectglobal.com",
-        "facebook.com/share",
-        "wa.me/share",
-        "instagram.com/share",
-        "linkedin.com/share",
-        "bnitos.com",
-    ]
-    return any(x in low for x in bad)
-
-
 def save_html(page, filename: str) -> None:
     if not DEBUG_HTML:
         return
@@ -102,9 +69,33 @@ def save_html(page, filename: str) -> None:
         print(f"Could not save HTML {filename}: {e}")
 
 
-# =========================================================
-# CSV
-# =========================================================
+def is_bad_website(url: str) -> bool:
+    low = (url or "").lower()
+    bad = [
+        "bniconnectglobal.com",
+        "bnitos.com",
+        "facebook.com/share",
+        "wa.me/share",
+        "instagram.com/share",
+        "linkedin.com/share",
+    ]
+    return any(x in low for x in bad)
+
+
+def looks_like_address(text: str) -> bool:
+    if not text:
+        return False
+    text = text.lower()
+    keywords = [
+        "road", "street", "lane", "nagar", "colony", "plot", "floor",
+        "building", "apartment", "complex", "near", "opp", "city",
+        "area", "block", "sector", "phase", "marg", "chowk", "society",
+        "west", "east", "north", "south", "office", "shop", "flat"
+    ]
+    return any(word in text for word in keywords)
+
+
+# ================= CSV =================
 def init_csv() -> None:
     with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow(HEADERS)
@@ -116,9 +107,7 @@ def append_csv(row: Dict) -> None:
         csv.writer(f).writerow([row.get(h, "") for h in HEADERS])
 
 
-# =========================================================
-# GOOGLE SHEET
-# =========================================================
+# ================= GOOGLE SHEET =================
 def flush_google_batch(rows: List[Dict]) -> None:
     if not rows:
         return
@@ -135,7 +124,7 @@ def flush_google_batch(rows: List[Dict]) -> None:
             print(f"Apps Script POST: {r.status_code} | batch={len(rows)}")
             if r.ok:
                 return
-            print(f"Response: {r.text[:200]}")
+            print(f"Response: {r.text[:300]}")
         except Exception as e:
             print(f"POST failed attempt {attempt}: {e}")
         time.sleep(2)
@@ -143,9 +132,7 @@ def flush_google_batch(rows: List[Dict]) -> None:
     print("Failed to post rows to Google Sheet")
 
 
-# =========================================================
-# PLAYWRIGHT HELPERS
-# =========================================================
+# ================= PLAYWRIGHT HELPERS =================
 def click_first_visible(page, selectors, timeout_ms=3000):
     for sel in selectors:
         try:
@@ -190,9 +177,7 @@ def fill_first_visible(page, selectors, value, press_enter=False):
     return False
 
 
-# =========================================================
-# LOGIN
-# =========================================================
+# ================= LOGIN =================
 def login(page) -> None:
     print("Login...")
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
@@ -221,9 +206,7 @@ def login(page) -> None:
     print("Login done")
 
 
-# =========================================================
-# SEARCH / COLLECT ALL MUMBAI LINKS
-# =========================================================
+# ================= SEARCH / COLLECT LINKS =================
 def open_search(page) -> None:
     page.goto(SEARCH_URL, wait_until="domcontentloaded")
     page.wait_for_timeout(5000)
@@ -390,9 +373,77 @@ def collect_all_links_for_city(page, city: str) -> List[Dict]:
     return collected
 
 
-# =========================================================
-# PROFILE EXTRACTION
-# =========================================================
+# ================= PROFILE CARD EXTRACTION =================
+def get_card_content(page, heading_text: str) -> Dict:
+    js = """
+    (headingText) => {
+        const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+        const headingNeedle = clean(headingText).toLowerCase();
+
+        const elements = Array.from(document.querySelectorAll('*'));
+        for (const el of elements) {
+            const text = clean(el.innerText);
+            if (!text) continue;
+            if (text.toLowerCase() !== headingNeedle) continue;
+
+            let card = el;
+            for (let i = 0; i < 7; i++) {
+                if (!card || !card.parentElement) break;
+                card = card.parentElement;
+                const cardText = clean(card.innerText);
+                if (cardText && cardText.toLowerCase().includes(headingNeedle) && cardText.length > headingText.length + 20) {
+                    return {
+                        text: card.innerText || '',
+                        links: Array.from(card.querySelectorAll('a[href]')).map(a => ({
+                            href: a.getAttribute('href') || '',
+                            text: clean(a.innerText)
+                        }))
+                    };
+                }
+            }
+        }
+        return { text: '', links: [] };
+    }
+    """
+    try:
+        return page.evaluate(js, heading_text)
+    except Exception:
+        return {"text": "", "links": []}
+
+
+def extract_anchor_data(card_links: List[Dict]) -> Dict:
+    data = {"phones": [], "emails": [], "websites": []}
+
+    for item in card_links:
+        href = norm(item.get("href", ""))
+        txt = norm(item.get("text", ""))
+
+        if href.startswith("tel:"):
+            p = clean_phone(href.replace("tel:", ""))
+            if p and p not in data["phones"]:
+                data["phones"].append(p)
+            continue
+
+        if href.startswith("mailto:"):
+            e = norm(href.replace("mailto:", ""))
+            if e and e not in data["emails"]:
+                data["emails"].append(e)
+            continue
+
+        if href.startswith("http") and not is_bad_website(href):
+            if href not in data["websites"]:
+                data["websites"].append(href)
+
+        if "@" in txt and txt not in data["emails"]:
+            data["emails"].append(txt)
+
+        cp = clean_phone(txt)
+        if cp and cp not in data["phones"]:
+            data["phones"].append(cp)
+
+    return data
+
+
 def extract_industry_from_profile(page) -> str:
     try:
         text = page.inner_text("body")
@@ -429,80 +480,53 @@ def extract_profile(page, member_industry: str = "") -> Dict:
         pass
     page.wait_for_timeout(2500)
 
-    try:
-        links = page.locator("a[href]")
-        count = links.count()
-        phones = []
-        emails = []
-        websites = []
+    personal = get_card_content(page, "Personal Details")
+    professional = get_card_content(page, "Professional Details")
+    bio = get_card_content(page, "My Bio")
+    if not bio.get("text"):
+        bio = get_card_content(page, "Bio")
 
-        for i in range(count):
-            href = (links.nth(i).get_attribute("href") or "").strip()
-            txt = norm(links.nth(i).inner_text())
+    personal_lines = [norm(x) for x in personal.get("text", "").splitlines() if norm(x)]
+    professional_lines = [norm(x) for x in professional.get("text", "").splitlines() if norm(x)]
+    bio_lines = [norm(x) for x in bio.get("text", "").splitlines() if norm(x)]
 
-            if href.startswith("tel:"):
-                p = clean_phone(href.replace("tel:", ""))
-                if p and p not in phones:
-                    phones.append(p)
-            elif href.startswith("mailto:"):
-                e = norm(href.replace("mailto:", ""))
-                if e and e not in emails:
-                    emails.append(e)
-            elif href.startswith("http") and not is_bad_website(href):
-                if href not in websites:
-                    websites.append(href)
+    anchor_data = extract_anchor_data(personal.get("links", []))
 
-            if "@" in txt and txt not in emails:
-                emails.append(txt)
+    if anchor_data["phones"]:
+        result["Phone"] = " / ".join(anchor_data["phones"][:2])
+    if anchor_data["emails"]:
+        result["Email"] = anchor_data["emails"][0]
+    if anchor_data["websites"]:
+        result["Website"] = anchor_data["websites"][0]
 
-            cp = clean_phone(txt)
-            if cp and cp not in phones:
-                phones.append(cp)
-
-        if phones:
-            result["Phone"] = " / ".join(phones[:2])
-        if emails:
-            result["Email"] = emails[0]
-        if websites:
-            result["Website"] = websites[0]
-    except Exception:
-        pass
-
-    try:
-        text = page.inner_text("body")
-    except Exception:
-        text = ""
-
-    lines = [norm(x) for x in text.splitlines() if norm(x)]
+    full_text = " ".join(personal_lines + professional_lines + bio_lines)
 
     if not result["Email"]:
-        em = find_email(text)
+        em = find_email(full_text)
         if em:
             result["Email"] = em
 
     if not result["Phone"]:
-        phones = re.findall(r"\+?\d[\d\s\-]{8,15}", text)
-        clean = []
-        for p in phones:
-            cp = clean_phone(p)
-            if cp and cp not in clean:
-                clean.append(cp)
-        if clean:
-            result["Phone"] = " / ".join(clean[:2])
+        phones = []
+        for line in personal_lines:
+            cp = clean_phone(line)
+            if cp and cp not in phones:
+                phones.append(cp)
+        if phones:
+            result["Phone"] = " / ".join(phones[:2])
 
     if not result["Website"]:
-        sites = re.findall(r"https?://[^\s]+", text)
-        for s in sites:
-            if not is_bad_website(s):
-                result["Website"] = s
+        for line in personal_lines:
+            if line.startswith("http") and not is_bad_website(line):
+                result["Website"] = line
                 break
 
     if not result["Address"]:
-        for i, line in enumerate(lines):
+        for i, line in enumerate(personal_lines):
             if line.lower() in {"city", "zip / postal code", "zip/postal code", "country"}:
                 addr_block = []
                 for j in range(max(0, i - 4), i):
-                    cand = lines[j]
+                    cand = personal_lines[j]
                     if looks_like_address(cand):
                         addr_block.append(cand)
                 if addr_block:
@@ -510,7 +534,7 @@ def extract_profile(page, member_industry: str = "") -> Dict:
                     break
 
     if not result["Address"]:
-        for line in lines:
+        for line in personal_lines:
             if looks_like_address(line):
                 result["Address"] = line
                 break
@@ -520,24 +544,27 @@ def extract_profile(page, member_industry: str = "") -> Dict:
         if parts:
             result["Professional Classification"] = parts[-1]
 
+    if not result["Professional Classification"]:
+        clean_prof = [x for x in professional_lines if x.lower() not in {"professional details"}]
+        if clean_prof:
+            first = clean_prof[0]
+            if first and len(first) < 120:
+                result["Professional Classification"] = first
+
     if not result["Business Description"]:
-        for i, line in enumerate(lines):
-            if line.lower() in {"professional details", "my bio", "bio"}:
-                block = []
-                for j in range(i + 1, min(len(lines), i + 5)):
-                    cand = lines[j]
-                    if cand.lower() in {"training history", "profile"}:
-                        break
-                    if cand and cand != result["Professional Classification"]:
-                        block.append(cand)
-                if block:
-                    result["Business Description"] = " ".join(block[:2])
-                    break
+        clean_prof = [x for x in professional_lines if x.lower() not in {"professional details"}]
+        if len(clean_prof) >= 2:
+            result["Business Description"] = clean_prof[1]
+
+    if not result["Business Description"] and bio_lines:
+        clean_bio = [x for x in bio_lines if x.lower() not in {"my bio", "bio"}]
+        if clean_bio:
+            result["Business Description"] = " ".join(clean_bio[:3])
 
     return result
 
 
-def scrape_one_profile(profile_page, member: Dict, city: str) -> Optional[Dict]:
+def scrape_one_profile(profile_page, member: Dict, city: str) -> Dict | None:
     url = member["href"]
 
     try:
@@ -548,7 +575,7 @@ def scrape_one_profile(profile_page, member: Dict, city: str) -> Optional[Dict]:
         return None
 
     prof = extract_profile(profile_page, member.get("industry", ""))
-    if not prof["Phone"] and not prof["Email"]:
+    if not prof["Phone"] and not prof["Email"] and not prof["Address"]:
         profile_page.wait_for_timeout(2000)
         prof = extract_profile(profile_page, member.get("industry", ""))
 
@@ -585,9 +612,7 @@ def scrape_one_profile(profile_page, member: Dict, city: str) -> Optional[Dict]:
     return final
 
 
-# =========================================================
-# MAIN
-# =========================================================
+# ================= MAIN =================
 def main():
     if not BNI_EMAIL or not BNI_PASSWORD:
         raise Exception("Missing BNI_EMAIL or BNI_PASSWORD")
