@@ -123,6 +123,7 @@ def flush_google_batch(rows: List[Dict]) -> None:
             r = requests.post(GOOGLE_WEBAPP_URL, json=payload, timeout=60)
             print(f"Apps Script POST: {r.status_code} | batch={len(rows)}")
             if r.ok:
+                print(f"Response: {r.text[:200]}")
                 return
             print(f"Response: {r.text[:300]}")
         except Exception as e:
@@ -285,19 +286,22 @@ def get_visible_members(page, city: str) -> List[Dict]:
 
         chapter = ""
         industry = ""
+        company = ""
 
         parts = [x.strip() for x in row_text.split("  ") if x.strip()]
         for p in parts:
             if p.startswith("BNI "):
                 chapter = p
-            if ">" in p and not industry:
+            elif ">" in p and not industry:
                 industry = p
+            elif p != name and not company and not p.startswith("BNI "):
+                company = p
 
         out.append({
             "name": name,
             "href": href,
             "chapter": chapter,
-            "company": "",
+            "company": company,
             "city": city,
             "industry": industry,
         })
@@ -564,7 +568,7 @@ def extract_profile(page, member_industry: str = "") -> Dict:
     return result
 
 
-def scrape_one_profile(profile_page, member: Dict, city: str) -> Dict | None:
+def scrape_one_profile(profile_page, member: Dict, city: str):
     url = member["href"]
 
     try:
@@ -602,12 +606,15 @@ def scrape_one_profile(profile_page, member: Dict, city: str) -> Dict | None:
     }
 
     print(f"Done: {final['Name']} | {city}")
+    print(f"Chapter: {final['Chapter']}")
+    print(f"Company: {final['Company']}")
     print(f"Phone: {final['Phone']}")
     print(f"Email: {final['Email']}")
     print(f"Website: {final['Website']}")
     print(f"Address: {final['Address']}")
-    print(f"Classification: {final['Professional Classification']}")
-    print(f"Industry: {final['Industry and Classification']}")
+    print(f"Professional Classification: {final['Professional Classification']}")
+    print(f"Business Description: {final['Business Description']}")
+    print(f"Industry and Classification: {final['Industry and Classification']}")
 
     return final
 
